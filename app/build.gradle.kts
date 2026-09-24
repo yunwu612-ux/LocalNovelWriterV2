@@ -8,6 +8,11 @@ android {
     namespace = "com.localnovelwriter.app"
     compileSdk = 35
 
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
     defaultConfig {
         applicationId = "com.localnovelwriter.app"
         minSdk = 26
@@ -15,6 +20,10 @@ android {
         versionCode = 2
         versionName = "2.0"
     }
+}
+
+kotlin {
+    jvmToolchain(17)
 }
 
 dependencies {
