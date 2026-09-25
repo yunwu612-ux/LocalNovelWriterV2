@@ -958,7 +958,7 @@ private fun NovelScreen(
                         // Reuse the parent-level exporter by invoking the same UI route.
                         // The parent supplies the actual file picker through onExportAll only,
                         // so selected export is performed by a small in-app event below.
-                        SelectedExportBus.request(novel, chapters)
+                        SelectedExportBus.request = novel to chapters
                     }
                 ) { Text("导出所选") }
             },
