@@ -1,25 +1,48 @@
 name: Build APK
+
 on:
   push:
     branches: ["main"]
   workflow_dispatch:
+
 permissions:
   contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
+
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.10.2"
-      - name: Build NEW v2 APK
-        run: gradle :app:assembleDebug --no-daemon
+
+      - name: Prepare stable signing key
+        env:
+          SIGNING_KEYSTORE_B64: ${{ secrets.SIGNING_KEYSTORE_B64 }}
+        run: |
+          if [ -z "$SIGNING_KEYSTORE_B64" ]; then
+            echo "SIGNING_KEYSTORE_B64 is not configured."
+            exit 1
+          fi
+
+          echo "$SIGNING_KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/localnovelwriter-release.jks"
+
+      - name: Build signed v2.1 APK
+        env:
+          SIGNING_KEYSTORE_PATH: ${{ runner.temp }}/localnovelwriter-release.jks
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: gradle :app:assembleRelease --no-daemon
+
       - uses: actions/upload-artifact@v4
         with:
-          name: LocalNovelWriter-v2-debug
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: LocalNovelWriter-v2.1-release
+          path: app/build/outputs/apk/release/app-release.apk
