@@ -5,6 +5,8 @@ import android.content.Context
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -37,12 +39,19 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.collectLatest
 import org.json.JSONArray
 import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.net.HttpURLConnection
+import java.net.Inet4Address
+import java.net.NetworkInterface
+import java.net.ServerSocket
+import java.net.URL
+import java.util.concurrent.Executors
 import sh.calvin.reorderable.*
 
 private data class Volume(val id: Long, var title: String)
@@ -272,9 +281,183 @@ private fun novelFromJson(json: String, fallbackId: Long): Novel {
     return Novel(o.optLong("id", fallbackId), o.optString("title", "未命名小说"), chapters, characters, worlds, volumes)
 }
 
+
+private fun projectToJson(novels: List<Novel>, trash: List<TrashItem>): String {
+    val root = JSONObject()
+    root.put("format", "LocalNovelWriterProject")
+    root.put("version", 1)
+    root.put("exportedAt", System.currentTimeMillis())
+    root.put("novels", JSONArray().apply { novels.forEach { put(JSONObject(novelToJson(it))) } })
+    root.put("trash", JSONArray().apply {
+        trash.forEach { item ->
+            put(JSONObject().apply {
+                put("id", item.id); put("novelId", item.novelId); put("novelTitle", item.novelTitle)
+                put("kind", item.kind); put("title", item.title); put("content", item.content)
+                put("volumeId", item.volumeId); put("status", item.status)
+            })
+        }
+    })
+    return root.toString()
+}
+
+private data class ProjectSnapshot(val novels: MutableList<Novel>, val trash: MutableList<TrashItem>)
+
+private fun projectFromJson(json: String): ProjectSnapshot {
+    val root = JSONObject(json)
+    require(root.optString("format") == "LocalNovelWriterProject") { "不是 LocalNovelWriter 项目文件" }
+    val novels = mutableListOf<Novel>()
+    root.optJSONArray("novels")?.let { a ->
+        for (i in 0 until a.length()) novels += novelFromJson(a.getJSONObject(i).toString(), System.currentTimeMillis() + i)
+    }
+    val trash = mutableListOf<TrashItem>()
+    root.optJSONArray("trash")?.let { a ->
+        for (i in 0 until a.length()) {
+            val x = a.getJSONObject(i)
+            trash += TrashItem(x.getLong("id"), x.getLong("novelId"), x.optString("novelTitle"), x.optString("kind"), x.optString("title"), x.optString("content"), x.optLong("volumeId", 0L), x.optString("status", "草稿"))
+        }
+    }
+    return ProjectSnapshot(novels, trash)
+}
+
+private class LanSyncManager(
+    private val context: Context,
+    private val store: LocalStore
+) {
+    private var server: ServerSocket? = null
+    private var serverThread: Thread? = null
+    private val executor = Executors.newCachedThreadPool()
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    @Volatile var running: Boolean = false
+        private set
+    @Volatile var lastMessage: String = "尚未同步"
+        private set
+
+    fun localAddress(): String? {
+        return runCatching {
+            NetworkInterface.getNetworkInterfaces().asSequence()
+                .flatMap { it.inetAddresses.toList().asSequence() }
+                .filterIsInstance<Inet4Address>()
+                .firstOrNull { !it.isLoopbackAddress && it.isSiteLocalAddress }
+                ?.hostAddress
+        }.getOrNull()
+    }
+
+    fun start(getSnapshot: () -> String, onReceive: (String) -> Unit) {
+        if (running) return
+        runCatching {
+            val socket = ServerSocket(38471)
+            server = socket
+            running = true
+            serverThread = Thread {
+                while (running) {
+                    try {
+                        val client = socket.accept()
+                        executor.execute { handle(client, getSnapshot, onReceive) }
+                    } catch (_: Exception) {
+                        if (running) lastMessage = "联动服务异常"
+                    }
+                }
+            }.also { it.isDaemon = true; it.start() }
+            lastMessage = "电脑联动已开启"
+        }.onFailure { lastMessage = "无法开启联动端口：${it.message ?: "未知错误"}" }
+    }
+
+    fun stop() {
+        running = false
+        runCatching { server?.close() }
+        server = null
+        serverThread = null
+        lastMessage = "联动已关闭"
+    }
+
+    private fun handle(socket: java.net.Socket, getSnapshot: () -> String, onReceive: (String) -> Unit) {
+        socket.use { s ->
+            s.soTimeout = 10_000
+            val input = s.getInputStream().bufferedReader(Charsets.UTF_8)
+            val requestLine = input.readLine() ?: return
+            val headers = mutableMapOf<String, String>()
+            while (true) {
+                val line = input.readLine() ?: break
+                if (line.isEmpty()) break
+                val idx = line.indexOf(':')
+                if (idx > 0) headers[line.substring(0, idx).trim().lowercase(Locale.US)] = line.substring(idx + 1).trim()
+            }
+            val method = requestLine.substringBefore(' ')
+            val path = requestLine.substringAfter(' ').substringBefore(' ')
+            if (method == "GET" && path == "/api/info") {
+                writeResponse(s, 200, JSONObject().apply { put("app", "LocalNovelWriter"); put("version", "2.5"); put("port", 38471) }.toString())
+                return
+            }
+            if (method == "GET" && path == "/api/project") {
+                writeResponse(s, 200, getSnapshot())
+                mainHandler.post { lastMessage = "电脑已读取手机项目" }
+                return
+            }
+            if (method == "POST" && path == "/api/project") {
+                val length = headers["content-length"]?.toIntOrNull() ?: 0
+                val body = CharArray(length)
+                var read = 0
+                while (read < length) {
+                    val n = input.read(body, read, length - read)
+                    if (n <= 0) break
+                    read += n
+                }
+                if (read != length) { writeResponse(s, 400, "请求数据不完整"); return }
+                runCatching {
+                    JSONObject(String(body).trim())
+                    mainHandler.post { onReceive(String(body).trim()) }
+                    writeResponse(s, 200, JSONObject().apply { put("ok", true); put("message", "同步数据已接收") }.toString())
+                    mainHandler.post { lastMessage = "电脑已发送项目到手机" }
+                }.onFailure { writeResponse(s, 400, "项目数据无效") }
+                return
+            }
+            writeResponse(s, 404, "Not Found")
+        }
+    }
+
+    private fun writeResponse(socket: java.net.Socket, code: Int, body: String) {
+        val bytes = body.toByteArray(Charsets.UTF_8)
+        val out = socket.getOutputStream().bufferedWriter(Charsets.UTF_8)
+        out.write("HTTP/1.1 $code ${if (code == 200) "OK" else "Bad Request"}\r\n")
+        out.write("Content-Type: application/json; charset=utf-8\r\n")
+        out.write("Content-Length: ${bytes.size}\r\n")
+        out.write("Connection: close\r\n\r\n")
+        out.flush()
+        socket.getOutputStream().write(bytes)
+        socket.getOutputStream().flush()
+    }
+
+    suspend fun pullFromComputer(baseUrl: String): Result<String> = runCatching {
+        val url = URL(baseUrl.trimEnd('/') + "/api/project")
+        val conn = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"; connectTimeout = 5000; readTimeout = 15000
+        }
+        conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }.also { conn.disconnect() }
+    }
+
+    suspend fun pushToComputer(baseUrl: String, snapshot: String): Result<String> = runCatching {
+        val url = URL(baseUrl.trimEnd('/') + "/api/project")
+        val conn = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"; doOutput = true; connectTimeout = 5000; readTimeout = 15000
+            setRequestProperty("Content-Type", "application/json; charset=utf-8")
+        }
+        conn.outputStream.use { it.write(snapshot.toByteArray(Charsets.UTF_8)) }
+        val response = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+        conn.disconnect()
+        response
+    }
+}
+
 @Composable
 private fun NovelApp(context: Context) {
     val store = remember { LocalStore(context) }
+    val syncManager = remember { LanSyncManager(context, store) }
+    var syncDialog by remember { mutableStateOf(false) }
+    var syncUrl by remember { mutableStateOf("") }
+    var syncMessage by remember { mutableStateOf("") }
+    var syncBusy by remember { mutableStateOf(false) }
+    DisposableEffect(Unit) { onDispose { syncManager.stop() } }
     var novels by remember { mutableStateOf(store.load()) }
     var trash by remember { mutableStateOf(store.loadTrash()) }
     var novelId by remember { mutableStateOf<Long?>(null) }
@@ -298,6 +481,32 @@ private fun NovelApp(context: Context) {
         }
     }
 
+    var pendingProjectJson by remember { mutableStateOf<String?>(null) }
+    val projectExportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/octet-stream")
+    ) { uri ->
+        val data = pendingProjectJson
+        pendingProjectJson = null
+        if (uri != null && data != null) runCatching {
+            context.contentResolver.openOutputStream(uri)?.bufferedWriter(Charsets.UTF_8)?.use { it.write(data) }
+        }
+    }
+    val projectImportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) runCatching {
+            val data = context.contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: return@runCatching
+            val snapshot = projectFromJson(data)
+            novels = snapshot.novels
+            trash = snapshot.trash
+            store.save(novels)
+            store.saveTrash(trash)
+            store.recordWordProgress(novels)
+            novelId = null
+            syncMessage = "完整项目已导入"
+        }.onFailure { syncMessage = "导入失败：${it.message ?: "项目文件无效"}" }
+    }
+
     val importLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument()
     ) { uri ->
@@ -318,6 +527,21 @@ private fun NovelApp(context: Context) {
         store.save(novels)
         store.saveTrash(trash)
         store.recordWordProgress(novels)
+    }
+
+    fun snapshotJson(): String = projectToJson(novels, trash)
+
+    fun importSnapshot(json: String) {
+        runCatching {
+            val snapshot = projectFromJson(json)
+            novels = snapshot.novels
+            trash = snapshot.trash
+            store.save(novels)
+            store.saveTrash(trash)
+            store.recordWordProgress(novels)
+            novelId = null
+            syncMessage = "同步完成：手机已更新"
+        }.onFailure { syncMessage = "同步失败：${it.message ?: "数据无效"}" }
     }
 
     fun exportNovel(novel: Novel, chapters: List<Chapter> = novel.chapters) {
@@ -414,6 +638,9 @@ private fun NovelApp(context: Context) {
                     },
                     onImport = { importLauncher.launch(arrayOf("text/plain", "text/markdown", "text/*")) },
                     onOpen = { novelId = it },
+                    onOpenSync = { syncDialog = true },
+                    onExportProject = { pendingProjectJson = snapshotJson(); projectExportLauncher.launch("LocalNovelWriter-项目备份.lnw") },
+                    onImportProject = { projectImportLauncher.launch(arrayOf("application/octet-stream", "application/json", "text/*")) },
                     onExport = { n -> exportNovel(n) },
                     onDelete = { id ->
                         novels.firstOrNull { it.id == id }?.let { n ->
@@ -494,6 +721,92 @@ private fun NovelApp(context: Context) {
                 )
             }
     }
+    if (syncDialog) {
+        SyncCenterDialog(
+            manager = syncManager,
+            snapshotProvider = { snapshotJson() },
+            onImportSnapshot = { importSnapshot(it) },
+            url = syncUrl,
+            onUrlChange = { syncUrl = it },
+            message = syncMessage,
+            onMessageChange = { syncMessage = it },
+            busy = syncBusy,
+            onBusyChange = { syncBusy = it },
+            onClose = { syncDialog = false }
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SyncCenterDialog(
+    manager: LanSyncManager,
+    snapshotProvider: () -> String,
+    onImportSnapshot: (String) -> Unit,
+    url: String,
+    onUrlChange: (String) -> Unit,
+    message: String,
+    onMessageChange: (String) -> Unit,
+    busy: Boolean,
+    onBusyChange: (Boolean) -> Unit,
+    onClose: () -> Unit
+) {
+    val scope = rememberCoroutineScope()
+    var running by remember { mutableStateOf(manager.running) }
+    AlertDialog(
+        onDismissRequest = onClose,
+        title = { Text("设备联动") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("手机与电脑可在同一 Wi-Fi 下直接同步，不需要账号或云服务器。", fontSize = 14.sp)
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("让电脑连接手机", fontWeight = FontWeight.Bold)
+                        Text(if (running) "联动服务：已开启" else "联动服务：未开启")
+                        if (running) Text("地址：http://${manager.localAddress() ?: "无法获取IP"}:38471", fontSize = 13.sp)
+                        Button(onClick = {
+                            if (running) { manager.stop(); running = false; onMessageChange("联动已关闭") }
+                            else { manager.start(snapshotProvider) { json -> onImportSnapshot(json) }; running = manager.running; onMessageChange(manager.lastMessage) }
+                        }, modifier = Modifier.fillMaxWidth()) {
+                            Icon(if (running) Icons.Default.Stop else Icons.Default.Wifi, null)
+                            Spacer(Modifier.width(6.dp)); Text(if (running) "关闭电脑联动" else "开启电脑联动")
+                        }
+                    }
+                }
+                HorizontalDivider()
+                Text("连接电脑", fontWeight = FontWeight.Bold)
+                OutlinedTextField(
+                    value = url,
+                    onValueChange = onUrlChange,
+                    singleLine = true,
+                    label = { Text("电脑地址，例如 http://192.168.1.10:38471") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(enabled = !busy && url.isNotBlank(), onClick = {
+                        onBusyChange(true); onMessageChange("正在从电脑读取项目……")
+                        scope.launch {
+                            val result = manager.pullFromComputer(url)
+                            result.onSuccess { onImportSnapshot(it) }.onFailure { onMessageChange("读取失败：${it.message ?: "连接失败"}") }
+                            onBusyChange(false)
+                        }
+                    }, modifier = Modifier.weight(1f)) { Text("电脑 → 手机") }
+                    Button(enabled = !busy && url.isNotBlank(), onClick = {
+                        onBusyChange(true); onMessageChange("正在发送项目到电脑……")
+                        scope.launch {
+                            val result = manager.pushToComputer(url, snapshotProvider())
+                            result.onSuccess { onMessageChange("同步完成：电脑已收到手机项目") }.onFailure { onMessageChange("发送失败：${it.message ?: "连接失败"}") }
+                            onBusyChange(false)
+                        }
+                    }, modifier = Modifier.weight(1f)) { Text("手机 → 电脑") }
+                }
+                if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+                if (message.isNotBlank()) Text(message, color = MaterialTheme.colorScheme.primary, fontSize = 13.sp)
+                Text("建议：每次同步前保留一份完整项目备份。发生冲突时，先不要覆盖双方数据。", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        },
+        confirmButton = { TextButton(onClick = onClose) { Text("关闭") } }
+    )
 }
 
 @Composable
@@ -512,6 +825,7 @@ private fun HomeScreen(
     novels: List<Novel>, dark: Boolean, onDark: () -> Unit, dockTab: String, onDockTab: (String) -> Unit,
     weekWords: Long, todayWords: Long, weeklyGoal: Int, totalWords: Int, trashCount: Int,
     onToggleOrientation: () -> Unit, onNew: () -> Unit, onImport: () -> Unit, onOpen: (Long) -> Unit,
+    onOpenSync: () -> Unit, onExportProject: () -> Unit, onImportProject: () -> Unit,
     onExport: (Novel) -> Unit, onDelete: (Long) -> Unit, onRestoreTrash: (TrashItem) -> Unit,
     onPermanentDeleteTrash: (TrashItem) -> Unit, onClearTrash: () -> Unit
 ) {
@@ -520,9 +834,14 @@ private fun HomeScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("本地小说 v2.4", fontWeight = FontWeight.Bold) },
+                title = { Text("本地小说 v2.5", fontWeight = FontWeight.Bold) },
                 actions = {
-                    if (dockTab == "books") IconButton(onClick = onImport) { Icon(Icons.Default.FileOpen, "导入小说") }
+                    if (dockTab == "books") {
+                        IconButton(onClick = onImport) { Icon(Icons.Default.FileOpen, "导入小说") }
+                        IconButton(onClick = onOpenSync) { Icon(Icons.Default.Sync, "设备联动") }
+                        IconButton(onClick = onExportProject) { Icon(Icons.Default.Archive, "导出完整项目") }
+                        IconButton(onClick = onImportProject) { Icon(Icons.Default.Unarchive, "导入完整项目") }
+                    }
                     IconButton(onClick = onToggleOrientation) { Icon(if (orientation == Configuration.ORIENTATION_LANDSCAPE) Icons.Default.StayCurrentPortrait else Icons.Default.ScreenRotation, "切换横竖屏") }
                     IconButton(onClick = onDark) { Icon(if (dark) Icons.Default.LightMode else Icons.Default.DarkMode, null) }
                 }
