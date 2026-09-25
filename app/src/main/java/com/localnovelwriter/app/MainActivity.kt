@@ -520,7 +520,7 @@ private fun HomeScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Column { Text("本地小说 v2.4", fontWeight = FontWeight.Bold); Text("完全离线 · 无 AI", fontSize = 12.sp) } },
+                title = { Text("本地小说 v2.4", fontWeight = FontWeight.Bold) },
                 actions = {
                     if (dockTab == "books") IconButton(onClick = onImport) { Icon(Icons.Default.FileOpen, "导入小说") }
                     IconButton(onClick = onToggleOrientation) { Icon(if (orientation == Configuration.ORIENTATION_LANDSCAPE) Icons.Default.StayCurrentPortrait else Icons.Default.ScreenRotation, "切换横竖屏") }
