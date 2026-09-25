@@ -498,6 +498,8 @@ private fun NovelApp(context: Context) {
                     onStatusChange = { id, status -> novel.chapters.firstOrNull { it.id == id }?.status = status; save() },
                     onAddCharacter = { val id = System.currentTimeMillis(); novel.characters += CharacterProfile(id, "新人物", "", "", "", "", "", "", ""); save(); characterId = id },
                     onAddWorld = { val id = System.currentTimeMillis(); novel.worlds += WorldEntry(id, "新世界", "", "", "", "", "", ""); save(); worldId = id },
+                    onOpenCharacter = { characterId = it },
+                    onOpenWorld = { worldId = it },
                     onDeleteCharacter = { id -> novel.characters.removeAll { it.id == id }; save() },
                     onDeleteWorld = { id -> novel.worlds.removeAll { it.id == id }; save() },
                     onExportAll = { exportNovel(novel) }
@@ -657,6 +659,7 @@ private fun NovelScreen(
     onRename: (String) -> Unit, onAddVolume: () -> Unit, onRenameVolume: (Long, String) -> Unit, onDeleteVolume: (Long) -> Unit,
     onMoveChapter: (Long, Long) -> Unit, onReorderChapters: (Long, Int, Int) -> Unit, onDeleteChapter: (Long) -> Unit,
     onStatusChange: (Long, String) -> Unit, onAddCharacter: () -> Unit, onAddWorld: () -> Unit,
+    onOpenCharacter: (Long) -> Unit, onOpenWorld: (Long) -> Unit,
     onDeleteCharacter: (Long) -> Unit, onDeleteWorld: (Long) -> Unit, onExportAll: () -> Unit
 ) {
     var rename by remember(novel.id) { mutableStateOf(false) }
@@ -684,8 +687,18 @@ private fun NovelScreen(
                         if (search.isNotEmpty()) OutlinedTextField(value = if (search == " ") "" else search, onValueChange = { search = it }, singleLine = true, label = { Text("搜索章节标题或正文") }, leadingIcon = { Icon(Icons.Default.Search, null) }, trailingIcon = { IconButton(onClick = { search = "" }) { Icon(Icons.Default.Clear, null) } }, modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp))
                         ChapterAndVolumeList(novel, onOpenChapter, onAddVolume, onRenameVolume = { id, t -> renameVolumeTarget = novel.volumes.firstOrNull { it.id == id }; volumeTitle = t }, onDeleteVolume = { id -> deleteVolumeTarget = novel.volumes.firstOrNull { it.id == id } }, onMoveChapter, onReorderChapters, onDeleteChapter, onStatusChange, if (search == " ") "" else search)
                     }
-                    "characters" -> DataList(novel.characters.map { it.id to it.name.ifBlank { "未命名人物" } }, onAddCharacter, onDeleteCharacter)
-                    else -> DataList(novel.worlds.map { it.id to it.name.ifBlank { "未命名世界" } }, onAddWorld, onDeleteWorld)
+                    "characters" -> DataList(
+                        items = novel.characters.map { it.id to it.name.ifBlank { "未命名人物" } },
+                        onAdd = onAddCharacter,
+                        onOpen = onOpenCharacter,
+                        onDelete = onDeleteCharacter
+                    )
+                    else -> DataList(
+                        items = novel.worlds.map { it.id to it.name.ifBlank { "未命名世界" } },
+                        onAdd = onAddWorld,
+                        onOpen = onOpenWorld,
+                        onDelete = onDeleteWorld
+                    )
                 }
             }
         }
@@ -783,10 +796,28 @@ private fun ChapterAndVolumeList(
 }
 
 @Composable
-private fun DataList(items: List<Pair<Long, String>>, onAdd: () -> Unit, onDelete: (Long) -> Unit) {
+private fun DataList(
+    items: List<Pair<Long, String>>,
+    onAdd: () -> Unit,
+    onOpen: (Long) -> Unit,
+    onDelete: (Long) -> Unit
+) {
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         item { Button(onClick = onAdd, Modifier.fillMaxWidth()) { Icon(Icons.Default.Add, null); Spacer(Modifier.width(6.dp)); Text("新建") } }
-        items(items, key = { it.first }) { item -> Card(Modifier.fillMaxWidth()) { Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) { Text(item.second, Modifier.weight(1f), fontWeight = FontWeight.Bold); IconButton(onClick = { onDelete(item.first) }) { Icon(Icons.Default.Delete, null) } } } }
+        items(items, key = { it.first }) { item ->
+            Card(
+                Modifier.fillMaxWidth().clickable { onOpen(item.first) }
+            ) {
+                Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text(item.second, fontWeight = FontWeight.Bold)
+                        Text("点击查看/编辑详情", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    IconButton(onClick = { onOpen(item.first) }) { Icon(Icons.Default.ChevronRight, "查看详情") }
+                    IconButton(onClick = { onDelete(item.first) }) { Icon(Icons.Default.Delete, "删除") }
+                }
+            }
+        }
     }
 }
 
