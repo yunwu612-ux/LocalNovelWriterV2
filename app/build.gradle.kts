@@ -13,12 +13,33 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
+    signingConfigs {
+        create("release") {
+            val storeFilePath = System.getenv("SIGNING_KEYSTORE_PATH")
+            val storePasswordEnv = System.getenv("SIGNING_STORE_PASSWORD")
+            val keyPasswordEnv = System.getenv("SIGNING_KEY_PASSWORD")
+            if (!storeFilePath.isNullOrBlank() && !storePasswordEnv.isNullOrBlank() && !keyPasswordEnv.isNullOrBlank()) {
+                storeFile = file(storeFilePath)
+                storePassword = storePasswordEnv
+                keyAlias = "localnovelwriter"
+                keyPassword = keyPasswordEnv
+            }
+        }
+    }
+
     defaultConfig {
         applicationId = "com.localnovelwriter.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "2.0"
+        versionCode = 3
+        versionName = "2.1"
+    }
+
+    buildTypes {
+        release {
+            signingConfig = signingConfigs.getByName("release")
+            isMinifyEnabled = false
+        }
     }
 }
 

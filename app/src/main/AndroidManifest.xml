@@ -4,10 +4,11 @@
         android:theme="@style/Theme.LocalNovelWriter"
         android:label="本地小说"
         android:allowBackup="true"
+        android:restoreAnyVersion="true"
         android:supportsRtl="true">
         <activity
             android:name=".MainActivity"
-            android:screenOrientation="portrait"
+            android:screenOrientation="fullUser"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN"/>

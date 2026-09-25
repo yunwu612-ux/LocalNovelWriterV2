@@ -1,6 +1,9 @@
 package com.localnovelwriter.app
 
+import android.app.Activity
 import android.content.Context
+import android.content.pm.ActivityInfo
+import android.content.res.Configuration
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -9,6 +12,9 @@ import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.togetherWith
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -22,6 +28,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -31,6 +38,9 @@ import kotlinx.coroutines.flow.collectLatest
 import androidx.compose.runtime.snapshotFlow
 import org.json.JSONArray
 import org.json.JSONObject
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 private data class Chapter(val id: Long, var title: String, var content: String)
 private data class CharacterProfile(
@@ -71,6 +81,7 @@ class MainActivity : ComponentActivity() {
 
 private class LocalStore(context: Context) {
     private val prefs = context.getSharedPreferences("novel_data", Context.MODE_PRIVATE)
+    private val statsPrefs = context.getSharedPreferences("novel_stats", Context.MODE_PRIVATE)
 
     fun load(): MutableList<Novel> = try {
         val array = JSONArray(prefs.getString("data", "[]"))
@@ -79,7 +90,6 @@ private class LocalStore(context: Context) {
             val chapters = mutableListOf<Chapter>()
             val characters = mutableListOf<CharacterProfile>()
             val worlds = mutableListOf<WorldEntry>()
-
             o.optJSONArray("chapters")?.let { a ->
                 for (j in 0 until a.length()) {
                     val x = a.getJSONObject(j)
@@ -89,77 +99,59 @@ private class LocalStore(context: Context) {
             o.optJSONArray("characters")?.let { a ->
                 for (j in 0 until a.length()) {
                     val x = a.getJSONObject(j)
-                    characters += CharacterProfile(
-                        x.getLong("id"), x.optString("name"), x.optString("identity"),
-                        x.optString("appearance"), x.optString("personality"), x.optString("background"),
-                        x.optString("abilities"), x.optString("relationships"), x.optString("notes")
-                    )
+                    characters += CharacterProfile(x.getLong("id"), x.optString("name"), x.optString("identity"), x.optString("appearance"), x.optString("personality"), x.optString("background"), x.optString("abilities"), x.optString("relationships"), x.optString("notes"))
                 }
             }
             o.optJSONArray("worlds")?.let { a ->
                 for (j in 0 until a.length()) {
                     val x = a.getJSONObject(j)
-                    worlds += WorldEntry(
-                        x.getLong("id"), x.optString("name"), x.optString("geography"),
-                        x.optString("races"), x.optString("history"), x.optString("factions"),
-                        x.optString("rules"), x.optString("notes")
-                    )
+                    worlds += WorldEntry(x.getLong("id"), x.optString("name"), x.optString("geography"), x.optString("races"), x.optString("history"), x.optString("factions"), x.optString("rules"), x.optString("notes"))
                 }
             }
             Novel(o.getLong("id"), o.optString("title"), chapters, characters, worlds)
         }
-    } catch (_: Exception) {
-        mutableListOf()
-    }
+    } catch (_: Exception) { mutableListOf() }
 
     fun save(novels: List<Novel>) {
         val array = JSONArray()
         novels.forEach { novel ->
-            val o = JSONObject()
-            o.put("id", novel.id)
-            o.put("title", novel.title)
-            o.put("chapters", JSONArray().apply {
-                novel.chapters.forEach { c ->
-                    put(JSONObject().apply {
-                        put("id", c.id)
-                        put("title", c.title)
-                        put("content", c.content)
-                    })
-                }
-            })
-            o.put("characters", JSONArray().apply {
-                novel.characters.forEach { c ->
-                    put(JSONObject().apply {
-                        put("id", c.id)
-                        put("name", c.name)
-                        put("identity", c.identity)
-                        put("appearance", c.appearance)
-                        put("personality", c.personality)
-                        put("background", c.background)
-                        put("abilities", c.abilities)
-                        put("relationships", c.relationships)
-                        put("notes", c.notes)
-                    })
-                }
-            })
-            o.put("worlds", JSONArray().apply {
-                novel.worlds.forEach { w ->
-                    put(JSONObject().apply {
-                        put("id", w.id)
-                        put("name", w.name)
-                        put("geography", w.geography)
-                        put("races", w.races)
-                        put("history", w.history)
-                        put("factions", w.factions)
-                        put("rules", w.rules)
-                        put("notes", w.notes)
-                    })
-                }
-            })
+            val o = JSONObject().apply {
+                put("id", novel.id); put("title", novel.title)
+                put("chapters", JSONArray().apply { novel.chapters.forEach { c -> put(JSONObject().apply { put("id", c.id); put("title", c.title); put("content", c.content) }) } })
+                put("characters", JSONArray().apply { novel.characters.forEach { c -> put(JSONObject().apply { put("id", c.id); put("name", c.name); put("identity", c.identity); put("appearance", c.appearance); put("personality", c.personality); put("background", c.background); put("abilities", c.abilities); put("relationships", c.relationships); put("notes", c.notes) }) } })
+                put("worlds", JSONArray().apply { novel.worlds.forEach { w -> put(JSONObject().apply { put("id", w.id); put("name", w.name); put("geography", w.geography); put("races", w.races); put("history", w.history); put("factions", w.factions); put("rules", w.rules); put("notes", w.notes) }) } })
+            }
             array.put(o)
         }
         prefs.edit().putString("data", array.toString()).apply()
     }
+
+    private fun todayKey(): String = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+
+    fun recordWordProgress(novels: List<Novel>) {
+        val today = todayKey()
+        val week = SimpleDateFormat("yyyy-'W'ww", Locale.US).format(Date())
+        val storedWeek = statsPrefs.getString("week", "")
+        val total = novels.sumOf { n -> n.chapters.sumOf { it.content.count { ch -> !ch.isWhitespace() } } }.toLong()
+        var lastTotal = statsPrefs.getLong("lastTotal", 0L)
+        if (storedWeek != week) {
+            statsPrefs.edit().putString("week", week).putLong("weekWords", 0L).putLong("lastTotal", total).apply()
+            lastTotal = total
+        }
+        val delta = (total - lastTotal).coerceAtLeast(0L)
+        if (delta > 0L) {
+            val editor = statsPrefs.edit()
+            editor.putLong("weekWords", statsPrefs.getLong("weekWords", 0L) + delta)
+            editor.putLong("day_$today", statsPrefs.getLong("day_$today", 0L) + delta)
+            editor.putLong("lastTotal", total)
+            editor.apply()
+        } else if (statsPrefs.getLong("lastTotal", Long.MIN_VALUE) == Long.MIN_VALUE) {
+            statsPrefs.edit().putLong("lastTotal", total).apply()
+        }
+    }
+
+    fun weeklyWords(): Long = statsPrefs.getLong("weekWords", 0L)
+    fun todayWords(): Long = statsPrefs.getLong("day_${todayKey()}", 0L)
 }
 
 @Composable
@@ -172,31 +164,19 @@ private fun NovelApp(context: Context) {
     var characterId by remember { mutableStateOf<Long?>(null) }
     var worldId by remember { mutableStateOf<Long?>(null) }
     var dark by remember { mutableStateOf(false) }
+    var dockTab by remember { mutableStateOf("books") }
 
-    fun save() = store.save(novels)
-
+    fun save() { store.save(novels); store.recordWordProgress(novels) }
     val novel = novels.firstOrNull { it.id == novelId }
     val chapter = novel?.chapters?.firstOrNull { it.id == chapterId }
+    val totalWords = novels.sumOf { n -> n.chapters.sumOf { it.content.count { ch -> !ch.isWhitespace() } } }
 
     BackHandler {
         when {
-            chapter != null -> {
-                chapterId = null
-                save()
-            }
-            characterId != null -> {
-                characterId = null
-                save()
-            }
-            worldId != null -> {
-                worldId = null
-                save()
-            }
-            novel != null -> {
-                novelId = null
-                section = "chapters"
-                save()
-            }
+            chapter != null -> { chapterId = null; save() }
+            characterId != null -> { characterId = null; save() }
+            worldId != null -> { worldId = null; save() }
+            novel != null -> { novelId = null; section = "chapters"; save() }
             else -> (context as? ComponentActivity)?.finish()
         }
     }
@@ -209,57 +189,29 @@ private fun NovelApp(context: Context) {
         ) { target ->
             when {
                 target.first == null -> HomeScreen(
-                    novels = novels,
-                    dark = dark,
-                    onDark = { dark = !dark },
+                    novels = novels, dark = dark, onDark = { dark = !dark }, dockTab = dockTab, onDockTab = { dockTab = it },
+                    weekWords = store.weeklyWords(), todayWords = store.todayWords(), totalWords = totalWords,
+                    onToggleOrientation = {
+                        val activity = context as? Activity
+                        if (activity != null) {
+                            activity.requestedOrientation = if (activity.resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) ActivityInfo.SCREEN_ORIENTATION_PORTRAIT else ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                        }
+                    },
                     onNew = {
                         val id = System.currentTimeMillis()
-                        val n = Novel(id, "未命名小说")
-                        n.chapters += Chapter(id + 1, "第一章", "")
-                        novels = (novels + n).toMutableList()
-                        save()
-                        novelId = id
-                    },
-                    onOpen = { novelId = it }
+                        val n = Novel(id, "未命名小说"); n.chapters += Chapter(id + 1, "第一章", "")
+                        novels = (novels + n).toMutableList(); save(); novelId = id
+                    }, onOpen = { novelId = it }
                 )
-                chapter != null && novel != null -> EditorScreen(
-                    chapter = chapter,
-                    novelTitle = novel.title,
-                    onBack = { chapterId = null; save() },
-                    onSave = { title, content -> chapter.title = title; chapter.content = content; save() }
-                )
-                characterId != null && novel != null -> {
-                    val c = novel.characters.firstOrNull { it.id == characterId }
-                    if (c != null) CharacterEditor(c, { characterId = null; save() })
-                }
-                worldId != null && novel != null -> {
-                    val w = novel.worlds.firstOrNull { it.id == worldId }
-                    if (w != null) WorldEditor(w, { worldId = null; save() })
-                }
+                chapter != null && novel != null -> EditorScreen(chapter, novel.title, { chapterId = null; save() }, { title, content -> chapter.title = title; chapter.content = content; save() })
+                characterId != null && novel != null -> novel.characters.firstOrNull { it.id == characterId }?.let { CharacterEditor(it) { characterId = null; save() } }
+                worldId != null && novel != null -> novel.worlds.firstOrNull { it.id == worldId }?.let { WorldEditor(it) { worldId = null; save() } }
                 novel != null -> NovelScreen(
-                    novel = novel,
-                    section = section,
-                    onSection = { section = it },
-                    onOpenChapter = { chapterId = it },
-                    onAddChapter = {
-                        val id = System.currentTimeMillis()
-                        novel.chapters += Chapter(id, "第${novel.chapters.size + 1}章", "")
-                        save()
-                        chapterId = id
-                    },
+                    novel = novel, section = section, onSection = { section = it }, onOpenChapter = { chapterId = it },
+                    onAddChapter = { val id = System.currentTimeMillis(); novel.chapters += Chapter(id, "第${novel.chapters.size + 1}章", ""); save(); chapterId = id },
                     onRename = { novel.title = it; save() },
-                    onAddCharacter = {
-                        val id = System.currentTimeMillis()
-                        novel.characters += CharacterProfile(id, "新人物", "", "", "", "", "", "", "")
-                        save()
-                        characterId = id
-                    },
-                    onAddWorld = {
-                        val id = System.currentTimeMillis()
-                        novel.worlds += WorldEntry(id, "新世界", "", "", "", "", "", "")
-                        save()
-                        worldId = id
-                    },
+                    onAddCharacter = { val id = System.currentTimeMillis(); novel.characters += CharacterProfile(id, "新人物", "", "", "", "", "", "", ""); save(); characterId = id },
+                    onAddWorld = { val id = System.currentTimeMillis(); novel.worlds += WorldEntry(id, "新世界", "", "", "", "", "", ""); save(); worldId = id },
                     onDeleteCharacter = { id -> novel.characters.removeAll { it.id == id }; save() },
                     onDeleteWorld = { id -> novel.worlds.removeAll { it.id == id }; save() }
                 )
@@ -268,54 +220,89 @@ private fun NovelApp(context: Context) {
     }
 }
 
+@Composable
+private fun HomeDock(selected: String, onSelected: (String) -> Unit) {
+    NavigationBar {
+        NavigationBarItem(selected == "books", { onSelected("books") }, icon = { Icon(Icons.Default.MenuBook, null) }, label = { Text("书籍") })
+        NavigationBarItem(selected == "notice", { onSelected("notice") }, icon = { Icon(Icons.Default.Campaign, null) }, label = { Text("公告") })
+        NavigationBarItem(selected == "stats", { onSelected("stats") }, icon = { Icon(Icons.Default.BarChart, null) }, label = { Text("本周统计") })
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun HomeScreen(
-    novels: List<Novel>,
-    dark: Boolean,
-    onDark: () -> Unit,
-    onNew: () -> Unit,
-    onOpen: (Long) -> Unit
+    novels: List<Novel>, dark: Boolean, onDark: () -> Unit, dockTab: String, onDockTab: (String) -> Unit,
+    weekWords: Long, todayWords: Long, totalWords: Int, onToggleOrientation: () -> Unit, onNew: () -> Unit, onOpen: (Long) -> Unit
 ) {
+    val orientation = androidx.compose.ui.platform.LocalConfiguration.current.orientation
     Scaffold(
         topBar = {
             TopAppBar(
-                title = {
-                    Column {
-                        Text("本地小说 v2.0", fontWeight = FontWeight.Bold)
-                        Text("完全离线 · 无 AI", fontSize = 12.sp)
-                    }
-                },
+                title = { Column { Text("本地小说 v2.1", fontWeight = FontWeight.Bold); Text("完全离线 · 无 AI", fontSize = 12.sp) } },
                 actions = {
-                    IconButton(onClick = onDark) {
-                        Icon(if (dark) Icons.Default.LightMode else Icons.Default.DarkMode, null)
-                    }
+                    IconButton(onClick = onToggleOrientation) { Icon(if (orientation == Configuration.ORIENTATION_LANDSCAPE) Icons.Default.StayCurrentPortrait else Icons.Default.ScreenRotation, "切换横竖屏") }
+                    IconButton(onClick = onDark) { Icon(if (dark) Icons.Default.LightMode else Icons.Default.DarkMode, null) }
                 }
             )
         },
-        floatingActionButton = {
-            FloatingActionButton(onClick = onNew) { Icon(Icons.Default.Add, null) }
-        }
+        bottomBar = { HomeDock(dockTab, onDockTab) },
+        floatingActionButton = { if (dockTab == "books") FloatingActionButton(onClick = onNew) { Icon(Icons.Default.Add, null) } }
     ) { padding ->
-        if (novels.isEmpty()) {
-            Box(Modifier.fillMaxSize().padding(padding), Alignment.Center) {
-                Text("还没有小说\n点击右下角 + 开始写作", fontSize = 20.sp)
-            }
-        } else {
-            LazyColumn(
-                Modifier.fillMaxSize().padding(padding),
-                contentPadding = PaddingValues(16.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                items(novels, key = { it.id }) { n ->
-                    Card(Modifier.fillMaxWidth().clickable { onOpen(n.id) }) {
-                        Column(Modifier.padding(18.dp)) {
-                            Text(n.title, fontSize = 20.sp, fontWeight = FontWeight.Bold)
-                            Text("${n.chapters.size} 章 · ${n.characters.size} 人物 · ${n.worlds.size} 世界资料")
+        AnimatedContent(targetState = dockTab, transitionSpec = { fadeIn().togetherWith(fadeOut()) }, modifier = Modifier.fillMaxSize().padding(padding), label = "dock") { tab ->
+            when (tab) {
+                "books" -> {
+                    if (novels.isEmpty()) Box(Modifier.fillMaxSize(), Alignment.Center) { Text("还没有小说\n点击右下角 + 开始写作", fontSize = 20.sp) }
+                    else LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        items(novels, key = { it.id }) { n ->
+                            Card(Modifier.fillMaxWidth().animateContentSize().clickable { onOpen(n.id) }) {
+                                Column(Modifier.padding(18.dp)) {
+                                    Text(n.title, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                                    Spacer(Modifier.height(6.dp))
+                                    Text("${n.chapters.size} 章 · ${n.characters.size} 人物 · ${n.worlds.size} 世界资料")
+                                    val count = n.chapters.sumOf { it.content.count { ch -> !ch.isWhitespace() } }
+                                    Text("${count} 字", fontSize = 13.sp, color = MaterialTheme.colorScheme.primary)
+                                }
+                            }
                         }
                     }
                 }
+                "notice" -> AnnouncementScreen()
+                else -> StatsScreen(weekWords, todayWords, totalWords)
             }
+        }
+    }
+}
+
+@Composable
+private fun AnnouncementScreen() {
+    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(18.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        item { Text("公告栏", fontSize = 28.sp, fontWeight = FontWeight.Bold) }
+        item { Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(18.dp)) { Text("V2.1 更新", fontWeight = FontWeight.Bold, fontSize = 20.sp); Spacer(Modifier.height(8.dp)); Text("新增底部 Dock、每周字数统计、横竖屏切换和更多页面动效。") } } }
+        item { Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(18.dp)) { Text("本地数据", fontWeight = FontWeight.Bold, fontSize = 20.sp); Spacer(Modifier.height(8.dp)); Text("小说内容继续保存在手机本地，不需要账号，也不会上传服务器。") } } }
+        item { Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(18.dp)) { Text("更新提示", fontWeight = FontWeight.Bold, fontSize = 20.sp); Spacer(Modifier.height(8.dp)); Text("以后更新请直接安装新 APK，不要先卸载旧版本。") } } }
+    }
+}
+
+@Composable
+private fun StatsScreen(weekWords: Long, todayWords: Long, totalWords: Int) {
+    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(18.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        item { Text("本周统计字数", fontSize = 28.sp, fontWeight = FontWeight.Bold) }
+        item { StatCard("本周新增", weekWords, Icons.Default.BarChart) }
+        item { StatCard("今日新增", todayWords, Icons.Default.Today) }
+        item { StatCard("当前总字数", totalWords.toLong(), Icons.Default.MenuBook) }
+        item { Text("统计从 V2.1 开始累计；每次保存内容时自动记录新增字数。", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+    }
+}
+
+@Composable
+private fun StatCard(title: String, value: Long, icon: androidx.compose.ui.graphics.vector.ImageVector) {
+    val scale by animateFloatAsState(if (value > 0) 1f else 0.98f, animationSpec = spring(), label = title)
+    Card(Modifier.fillMaxWidth().graphicsLayer(scaleX = scale, scaleY = scale)) {
+        Row(Modifier.padding(20.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(icon, null, modifier = Modifier.size(36.dp), tint = MaterialTheme.colorScheme.primary)
+            Spacer(Modifier.width(16.dp))
+            Column { Text(title, color = MaterialTheme.colorScheme.onSurfaceVariant); Text("$value 字", fontSize = 30.sp, fontWeight = FontWeight.Bold) }
         }
     }
 }
