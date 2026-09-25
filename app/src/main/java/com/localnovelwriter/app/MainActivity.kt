@@ -12,12 +12,6 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.setContent
-import androidx.compose.animation.AnimatedContent
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.togetherWith
-import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.lazy.LazyColumn
@@ -529,6 +523,12 @@ private fun NovelApp(context: Context) {
         store.recordWordProgress(novels)
     }
 
+    // Editor autosave intentionally skips the full-library word-count scan.
+    // The final save when leaving the editor still records statistics.
+    fun saveEditorContent() {
+        store.save(novels)
+    }
+
     fun snapshotJson(): String = projectToJson(novels, trash)
 
     fun importSnapshot(json: String) {
@@ -680,7 +680,7 @@ private fun NovelApp(context: Context) {
                     chapter = chapter,
                     novelTitle = novel.title,
                     onBack = { chapterId = null; save() },
-                    onSave = { title, content -> chapter.title = title; chapter.content = content; save() }
+                    onSave = { title, content -> chapter.title = title; chapter.content = content; saveEditorContent() }
                 )
                 characterId != null && novel != null -> novel.characters.firstOrNull { it.id == characterId }?.let { CharacterEditor(it) { characterId = null; save() } }
                 worldId != null && novel != null -> novel.worlds.firstOrNull { it.id == worldId }?.let { WorldEditor(it) { worldId = null; save() } }
@@ -850,8 +850,9 @@ private fun HomeScreen(
         bottomBar = { HomeDock(dockTab, onDockTab) },
         floatingActionButton = { if (dockTab == "books") FloatingActionButton(onClick = onNew) { Icon(Icons.Default.Add, null) } }
     ) { padding ->
-        AnimatedContent(targetState = dockTab, transitionSpec = { fadeIn(animationSpec = tween(120)).togetherWith(fadeOut(animationSpec = tween(90))) }, modifier = Modifier.fillMaxSize().padding(padding), label = "dock") { tab ->
-            when (tab) {
+        // Bottom-tab content switches directly to avoid rebuilding two large pages during animation.
+        Box(Modifier.fillMaxSize().padding(padding)) {
+            when (dockTab) {
                 "books" -> {
                     if (novels.isEmpty()) Box(Modifier.fillMaxSize(), Alignment.Center) { Text("还没有小说\n点击右下角 + 开始写作", fontSize = 20.sp) }
                     else LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -899,7 +900,7 @@ private fun AnnouncementScreen() {
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(18.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
         item { Text("公告栏", fontSize = 28.sp, fontWeight = FontWeight.Bold) }
         item { Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(18.dp)) { Text("📌 永久公告", fontWeight = FontWeight.Bold, fontSize = 20.sp); Spacer(Modifier.height(8.dp)); Text("每次更新 App 前，请先在应用内导出小说备份。\n\n建议同时保留 TXT 备份与完整的本地数据备份。更新过程中不要卸载旧版本，以免丢失本地数据。") } } }
-        item { Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(18.dp)) { Text("V2.4 更新", fontWeight = FontWeight.Bold, fontSize = 20.sp); Spacer(Modifier.height(8.dp)); Text("优化页面动效与列表滚动性能，减少大页面切换和列表展开时的卡顿。") } } }
+        item { Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(18.dp)) { Text("V2.5 更新", fontWeight = FontWeight.Bold, fontSize = 20.sp); Spacer(Modifier.height(8.dp)); Text("新增设备联动基础功能，支持手机与电脑通过局域网进行双向同步，并加入完整小说项目 .lnw 导入与导出，为后续电脑端联动做好准备。") } } }
         item { Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(18.dp)) { Text("本地数据", fontWeight = FontWeight.Bold, fontSize = 20.sp); Spacer(Modifier.height(8.dp)); Text("小说内容继续保存在手机本地，不需要账号，也不会上传服务器。") } } }
         item { Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(18.dp)) { Text("更新提示", fontWeight = FontWeight.Bold, fontSize = 20.sp); Spacer(Modifier.height(8.dp)); Text("以后更新请直接安装新 APK，不要先卸载旧版本。") } } }
     }
@@ -932,8 +933,16 @@ private fun StatsScreen(weekWords: Long, todayWords: Long, weeklyGoal: Int, tota
 
 @Composable
 private fun StatCard(title: String, value: Long, icon: androidx.compose.ui.graphics.vector.ImageVector) {
-    val scale by animateFloatAsState(if (value > 0) 1f else 0.98f, animationSpec = tween(120), label = title)
-    Card(Modifier.fillMaxWidth().graphicsLayer(scaleX = scale, scaleY = scale)) { Row(Modifier.padding(20.dp), verticalAlignment = Alignment.CenterVertically) { Icon(icon, null, modifier = Modifier.size(36.dp), tint = MaterialTheme.colorScheme.primary); Spacer(Modifier.width(16.dp)); Column { Text(title, color = MaterialTheme.colorScheme.onSurfaceVariant); Text("$value 字", fontSize = 30.sp, fontWeight = FontWeight.Bold) } } }
+    Card(Modifier.fillMaxWidth()) {
+        Row(Modifier.padding(20.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(icon, null, modifier = Modifier.size(36.dp), tint = MaterialTheme.colorScheme.primary)
+            Spacer(Modifier.width(16.dp))
+            Column {
+                Text(title, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("$value 字", fontSize = 30.sp, fontWeight = FontWeight.Bold)
+            }
+        }
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -987,8 +996,7 @@ private fun NovelScreen(
                 FilterChip(section == "characters", { onSection("characters") }, label = { Text("人物") })
                 FilterChip(section == "world", { onSection("world") }, label = { Text("世界") })
             }
-            AnimatedContent(targetState = section, transitionSpec = { fadeIn(animationSpec = tween(120)).togetherWith(fadeOut(animationSpec = tween(90))) }, modifier = Modifier.fillMaxSize(), label = "bookSection") { current ->
-                when (current) {
+            when (section) {
                     "chapters" -> Column(Modifier.fillMaxSize()) {
                         if (search.isNotEmpty()) OutlinedTextField(value = if (search == " ") "" else search, onValueChange = { search = it }, singleLine = true, label = { Text("搜索章节标题或正文") }, leadingIcon = { Icon(Icons.Default.Search, null) }, trailingIcon = { IconButton(onClick = { search = "" }) { Icon(Icons.Default.Clear, null) } }, modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp))
                         ChapterAndVolumeList(novel, onOpenChapter, onAddVolume, onRenameVolume = { id, t -> renameVolumeTarget = novel.volumes.firstOrNull { it.id == id }; volumeTitle = t }, onDeleteVolume = { id -> deleteVolumeTarget = novel.volumes.firstOrNull { it.id == id } }, onMoveChapter, onReorderChapters, onDeleteChapter, onStatusChange, if (search == " ") "" else search)
@@ -1006,7 +1014,6 @@ private fun NovelScreen(
                         onDelete = onDeleteWorld
                     )
                 }
-            }
         }
     }
     if (rename) AlertDialog(onDismissRequest = { rename = false }, title = { Text("重命名小说") }, text = { OutlinedTextField(value = title, onValueChange = { title = it }, singleLine = true) }, confirmButton = { TextButton(onClick = { if (title.isNotBlank()) onRename(title); rename = false }) { Text("保存") } }, dismissButton = { TextButton(onClick = { rename = false }) { Text("取消") } })
@@ -1031,12 +1038,19 @@ private fun ChapterAndVolumeList(
     LaunchedEffect(SelectedExportBus.request) { val request = SelectedExportBus.request ?: return@LaunchedEffect; if (request.first.id == novel.id) { pendingText = exportText(request.first, request.second); launcher.launch("${request.first.title}-选中章节.txt"); SelectedExportBus.request = null } }
     var menuChapter by remember { mutableStateOf<Chapter?>(null) }
     var statusChapter by remember { mutableStateOf<Chapter?>(null) }
+    val normalizedSearch = searchQuery.trim()
+    val filteredChapters by remember(novel.id, searchQuery, novel.chapters.size) {
+        derivedStateOf {
+            if (normalizedSearch.isBlank()) novel.chapters
+            else novel.chapters.filter { it.title.contains(normalizedSearch, ignoreCase = true) || it.content.contains(normalizedSearch, ignoreCase = true) }
+        }
+    }
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         item { Card(Modifier.fillMaxWidth()) { Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("分卷", fontSize = 20.sp, fontWeight = FontWeight.Bold); Text("${novel.volumes.size} 卷 · ${novel.chapters.size} 章") }; Button(onClick = onAddVolume) { Icon(Icons.Default.Add, null); Spacer(Modifier.width(4.dp)); Text("新建分卷") } } } }
         novel.volumes.forEach { volume ->
             item(key = "volume_${volume.id}") {
                 var expanded by remember(volume.id) { mutableStateOf(true) }
-                val chapters = novel.chapters.filter { it.volumeId == volume.id }.filter { c -> searchQuery.isBlank() || c.title.contains(searchQuery, true) || c.content.contains(searchQuery, true) }
+                val chapters = filteredChapters.filter { it.volumeId == volume.id }
                 Card(Modifier.fillMaxWidth()) {
                     Column {
                         Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -1250,7 +1264,8 @@ private fun EditorScreen(chapter: Chapter, novelTitle: String, onBack: () -> Uni
     var title by remember(chapter.id) { mutableStateOf(chapter.title) }
     var content by remember(chapter.id) { mutableStateOf(chapter.content) }
     var readingMode by remember(chapter.id) { mutableStateOf(false) }
-    LaunchedEffect(title, content) { delay(400); onSave(title, content) }
+    // Debounce autosave to reduce JSON serialization and disk writes while typing.
+    LaunchedEffect(title, content) { delay(1000); onSave(title, content) }
     Scaffold(topBar = {
         TopAppBar(
             title = { Column { Text(novelTitle); if (readingMode) Text("阅读模式", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary) } },
