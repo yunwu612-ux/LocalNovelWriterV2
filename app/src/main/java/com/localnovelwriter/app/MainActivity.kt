@@ -234,7 +234,14 @@ private fun importNovelFromText(text: String, forcedId: Long? = null): Novel {
             line.startsWith("## ") && !line.startsWith("### ") -> { finish(); volume = Volume(System.currentTimeMillis() + volumes.size + 1000L, line.removePrefix("## ").trim().ifBlank { "第${volumes.size + 1}卷" }); volumes += volume }
             line.startsWith("### ") -> { finish(); current = Chapter(System.currentTimeMillis() + chapters.size + 1L, line.removePrefix("### ").trim().ifBlank { "第${chapters.size + 1}章" }, "", volume.id) }
             line.matches(Regex("^第.+章$")) && current == null -> current = Chapter(System.currentTimeMillis() + chapters.size + 1L, line.trim(), "", volume.id)
-            else -> if (current == null) { current = Chapter(System.currentTimeMillis() + chapters.size + 1L, "第一章", "", volume.id) }; current = current?.copy(content = if (current!!.content.isEmpty()) line else current!!.content + "\n" + line)
+            else -> {
+                if (current == null) {
+                    current = Chapter(System.currentTimeMillis() + chapters.size + 1L, "第一章", "", volume.id)
+                }
+                current = current?.copy(
+                    content = if (current!!.content.isEmpty()) line else current!!.content + "\n" + line
+                )
+            }
         }
     }
     finish()
