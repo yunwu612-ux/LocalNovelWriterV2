@@ -11,14 +11,11 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.setContent
 import androidx.compose.animation.AnimatedContent
-import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
-import androidx.compose.animation.scaleIn
-import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.togetherWith
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.lazy.LazyColumn
@@ -387,19 +384,10 @@ private fun NovelApp(context: Context) {
     }
 
     MaterialTheme(colorScheme = if (dark) darkColorScheme() else lightColorScheme()) {
-        AnimatedContent(
-            targetState = Triple(
-                novelId,
-                chapterId,
-                if (characterId != null) "character"
-                else if (worldId != null) "world"
-                else section
-            ),
-            transitionSpec = { (fadeIn() + slideInHorizontally { it / 8 }).togetherWith(fadeOut()) },
-            label = "screen"
-        ) { target ->
-            when {
-                target.first == null -> HomeScreen(
+        // 大页面切换不再使用 AnimatedContent：避免每次进入小说/编辑器时同时重组整棵页面树，
+        // 对长列表和编辑器尤其明显地降低卡顿。局部标签仍保留轻量淡入动画。
+        when {
+            novelId == null -> HomeScreen(
                     novels = novels,
                     dark = dark,
                     onDark = { dark = !dark },
@@ -505,7 +493,6 @@ private fun NovelApp(context: Context) {
                     onExportAll = { exportNovel(novel) }
                 )
             }
-        }
     }
 }
 
@@ -533,7 +520,7 @@ private fun HomeScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Column { Text("本地小说 v2.3", fontWeight = FontWeight.Bold); Text("完全离线 · 无 AI", fontSize = 12.sp) } },
+                title = { Column { Text("本地小说 v2.4", fontWeight = FontWeight.Bold); Text("完全离线 · 无 AI", fontSize = 12.sp) } },
                 actions = {
                     if (dockTab == "books") IconButton(onClick = onImport) { Icon(Icons.Default.FileOpen, "导入小说") }
                     IconButton(onClick = onToggleOrientation) { Icon(if (orientation == Configuration.ORIENTATION_LANDSCAPE) Icons.Default.StayCurrentPortrait else Icons.Default.ScreenRotation, "切换横竖屏") }
@@ -544,14 +531,14 @@ private fun HomeScreen(
         bottomBar = { HomeDock(dockTab, onDockTab) },
         floatingActionButton = { if (dockTab == "books") FloatingActionButton(onClick = onNew) { Icon(Icons.Default.Add, null) } }
     ) { padding ->
-        AnimatedContent(targetState = dockTab, transitionSpec = { fadeIn() togetherWith fadeOut() }, modifier = Modifier.fillMaxSize().padding(padding), label = "dock") { tab ->
+        AnimatedContent(targetState = dockTab, transitionSpec = { fadeIn(animationSpec = tween(120)).togetherWith(fadeOut(animationSpec = tween(90))) }, modifier = Modifier.fillMaxSize().padding(padding), label = "dock") { tab ->
             when (tab) {
                 "books" -> {
                     if (novels.isEmpty()) Box(Modifier.fillMaxSize(), Alignment.Center) { Text("还没有小说\n点击右下角 + 开始写作", fontSize = 20.sp) }
                     else LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         items(novels, key = { it.id }) { n ->
                             var menu by remember(n.id) { mutableStateOf(false) }
-                            Card(Modifier.fillMaxWidth().animateContentSize()) {
+                            Card(Modifier.fillMaxWidth()) {
                                 Column(Modifier.padding(18.dp)) {
                                     Row(verticalAlignment = Alignment.CenterVertically) {
                                         Column(Modifier.weight(1f).clickable { onOpen(n.id) }) {
@@ -593,7 +580,7 @@ private fun AnnouncementScreen() {
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(18.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
         item { Text("公告栏", fontSize = 28.sp, fontWeight = FontWeight.Bold) }
         item { Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(18.dp)) { Text("📌 永久公告", fontWeight = FontWeight.Bold, fontSize = 20.sp); Spacer(Modifier.height(8.dp)); Text("每次更新 App 前，请先在应用内导出小说备份。\n\n建议同时保留 TXT 备份与完整的本地数据备份。更新过程中不要卸载旧版本，以免丢失本地数据。") } } }
-        item { Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(18.dp)) { Text("V2.3 更新", fontWeight = FontWeight.Bold, fontSize = 20.sp); Spacer(Modifier.height(8.dp)); Text("新增章节状态、回收站、写作目标、阅读模式、章节拖动排序、章节搜索、小说导入/导出，以及分卷删除。") } } }
+        item { Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(18.dp)) { Text("V2.4 更新", fontWeight = FontWeight.Bold, fontSize = 20.sp); Spacer(Modifier.height(8.dp)); Text("优化页面动效与列表滚动性能，减少大页面切换和列表展开时的卡顿。") } } }
         item { Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(18.dp)) { Text("本地数据", fontWeight = FontWeight.Bold, fontSize = 20.sp); Spacer(Modifier.height(8.dp)); Text("小说内容继续保存在手机本地，不需要账号，也不会上传服务器。") } } }
         item { Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(18.dp)) { Text("更新提示", fontWeight = FontWeight.Bold, fontSize = 20.sp); Spacer(Modifier.height(8.dp)); Text("以后更新请直接安装新 APK，不要先卸载旧版本。") } } }
     }
@@ -626,7 +613,7 @@ private fun StatsScreen(weekWords: Long, todayWords: Long, weeklyGoal: Int, tota
 
 @Composable
 private fun StatCard(title: String, value: Long, icon: androidx.compose.ui.graphics.vector.ImageVector) {
-    val scale by animateFloatAsState(if (value > 0) 1f else 0.98f, animationSpec = spring(), label = title)
+    val scale by animateFloatAsState(if (value > 0) 1f else 0.98f, animationSpec = tween(120), label = title)
     Card(Modifier.fillMaxWidth().graphicsLayer(scaleX = scale, scaleY = scale)) { Row(Modifier.padding(20.dp), verticalAlignment = Alignment.CenterVertically) { Icon(icon, null, modifier = Modifier.size(36.dp), tint = MaterialTheme.colorScheme.primary); Spacer(Modifier.width(16.dp)); Column { Text(title, color = MaterialTheme.colorScheme.onSurfaceVariant); Text("$value 字", fontSize = 30.sp, fontWeight = FontWeight.Bold) } } }
 }
 
@@ -681,7 +668,7 @@ private fun NovelScreen(
                 FilterChip(section == "characters", { onSection("characters") }, label = { Text("人物") })
                 FilterChip(section == "world", { onSection("world") }, label = { Text("世界") })
             }
-            AnimatedContent(targetState = section, transitionSpec = { (fadeIn() + slideInHorizontally { it / 10 }).togetherWith(fadeOut()) }, modifier = Modifier.fillMaxSize(), label = "bookSection") { current ->
+            AnimatedContent(targetState = section, transitionSpec = { fadeIn(animationSpec = tween(120)).togetherWith(fadeOut(animationSpec = tween(90))) }, modifier = Modifier.fillMaxSize(), label = "bookSection") { current ->
                 when (current) {
                     "chapters" -> Column(Modifier.fillMaxSize()) {
                         if (search.isNotEmpty()) OutlinedTextField(value = if (search == " ") "" else search, onValueChange = { search = it }, singleLine = true, label = { Text("搜索章节标题或正文") }, leadingIcon = { Icon(Icons.Default.Search, null) }, trailingIcon = { IconButton(onClick = { search = "" }) { Icon(Icons.Default.Clear, null) } }, modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp))
@@ -731,7 +718,7 @@ private fun ChapterAndVolumeList(
             item(key = "volume_${volume.id}") {
                 var expanded by remember(volume.id) { mutableStateOf(true) }
                 val chapters = novel.chapters.filter { it.volumeId == volume.id }.filter { c -> searchQuery.isBlank() || c.title.contains(searchQuery, true) || c.content.contains(searchQuery, true) }
-                Card(Modifier.fillMaxWidth().animateContentSize()) {
+                Card(Modifier.fillMaxWidth()) {
                     Column {
                         Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
                             IconButton(onClick = { expanded = !expanded }) { Icon(if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore, null) }
