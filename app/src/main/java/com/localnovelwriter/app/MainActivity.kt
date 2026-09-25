@@ -19,6 +19,13 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
+import androidx.compose.animation.core.tween
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -608,9 +615,24 @@ private fun NovelApp(context: Context) {
     }
 
     MaterialTheme(colorScheme = if (dark) darkColorScheme() else lightColorScheme()) {
-        // 大页面切换不再使用 AnimatedContent：避免每次进入小说/编辑器时同时重组整棵页面树，
-        // 对长列表和编辑器尤其明显地降低卡顿。局部标签仍保留轻量淡入动画。
-        when {
+        // 恢复轻量页面动效：只对“页面入口/退出”做 160ms 的淡入 + 小幅滑动，
+        // 列表、编辑器和卡片内部不做持续动画，避免 V2.4 那种大范围动画带来的卡顿。
+        val screenToken = when {
+            novelId == null -> "home:$dockTab"
+            chapterId != null -> "chapter:$novelId:$chapterId"
+            characterId != null -> "character:$novelId:$characterId"
+            worldId != null -> "world:$novelId:$worldId"
+            else -> "novel:$novelId:$section"
+        }
+        AnimatedContent(
+            targetState = screenToken,
+            transitionSpec = {
+                (fadeIn(animationSpec = tween(160)) + slideInHorizontally(animationSpec = tween(160)) { it / 14 })
+                    .togetherWith(fadeOut(animationSpec = tween(110)) + slideOutHorizontally(animationSpec = tween(110)) { -it / 18 })
+            },
+            label = "pageTransition"
+        ) { _ ->
+            when {
             novelId == null -> HomeScreen(
                     novels = novels,
                     dark = dark,
@@ -720,6 +742,7 @@ private fun NovelApp(context: Context) {
                     onExportAll = { exportNovel(novel) }
                 )
             }
+        }
     }
     if (syncDialog) {
         SyncCenterDialog(
@@ -850,9 +873,17 @@ private fun HomeScreen(
         bottomBar = { HomeDock(dockTab, onDockTab) },
         floatingActionButton = { if (dockTab == "books") FloatingActionButton(onClick = onNew) { Icon(Icons.Default.Add, null) } }
     ) { padding ->
-        // Bottom-tab content switches directly to avoid rebuilding two large pages during animation.
+        // 底部标签保留轻量横向切换动效；LazyColumn 本身不做动画。
         Box(Modifier.fillMaxSize().padding(padding)) {
-            when (dockTab) {
+            AnimatedContent(
+                targetState = dockTab,
+                transitionSpec = {
+                    (fadeIn(tween(140)) + slideInHorizontally(tween(140)) { it / 20 })
+                        .togetherWith(fadeOut(tween(100)) + slideOutHorizontally(tween(100)) { -it / 24 })
+                },
+                label = "homeTabTransition"
+            ) { tab ->
+            when (tab) {
                 "books" -> {
                     if (novels.isEmpty()) Box(Modifier.fillMaxSize(), Alignment.Center) { Text("还没有小说\n点击右下角 + 开始写作", fontSize = 20.sp) }
                     else LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -885,6 +916,7 @@ private fun HomeScreen(
                 "notice" -> AnnouncementScreen()
                 "trash" -> TrashScreen(trashCount, onRestoreTrash, onPermanentDeleteTrash, onClearTrash)
                 else -> StatsScreen(weekWords, todayWords, weeklyGoal, totalWords)
+            }
             }
         }
     }
