@@ -585,6 +585,10 @@ private fun NovelApp(context: Context) {
         }
     }
 
+    // Cached library word count: only recalculated when data is explicitly saved.
+    // Keep this state declared before local save() so the local function can capture it.
+    var totalWords by remember { mutableIntStateOf(store.totalWordCount(novels)) }
+
     fun save() {
         store.save(novels)
         store.saveTrash(trash)
@@ -663,8 +667,6 @@ private fun NovelApp(context: Context) {
 
     val novel = novels.firstOrNull { it.id == novelId }
     val chapter = novel?.chapters?.firstOrNull { it.id == chapterId }
-    var totalWords by remember { mutableIntStateOf(store.totalWordCount(novels)) }
-
     BackHandler {
         when {
             chapter != null -> { chapterId = null; save() }
