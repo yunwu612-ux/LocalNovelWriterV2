@@ -116,6 +116,7 @@ class MainActivity : ComponentActivity() {
 }
 
 private class LocalStore(context: Context) {
+    private val appContext = context.applicationContext
     private val prefs = context.getSharedPreferences("novel_data", Context.MODE_PRIVATE)
     private val statsPrefs = context.getSharedPreferences("novel_stats", Context.MODE_PRIVATE)
     private val trashPrefs = context.getSharedPreferences("novel_trash", Context.MODE_PRIVATE)
@@ -188,11 +189,14 @@ private class LocalStore(context: Context) {
 
     fun backupProjectSnapshot(json: String): String? {
         return runCatching {
-            val dir = File(context.filesDir, "sync_backups")
+            val dir = File(appContext.filesDir, "sync_backups")
             dir.mkdirs()
             val file = File(dir, "backup_${System.currentTimeMillis()}.lnw")
             file.writeText(json, Charsets.UTF_8)
-            dir.listFiles()?.sortedByDescending { it.lastModified() }?.drop(5)?.forEach { it.delete() }
+            val backups = dir.listFiles() ?: emptyArray()
+            backups.sortedByDescending { backupFile -> backupFile.lastModified() }
+                .drop(5)
+                .forEach { oldBackup -> oldBackup.delete() }
             file.absolutePath
         }.getOrNull()
     }
