@@ -39,8 +39,12 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.collectLatest
 import org.json.JSONArray
 import org.json.JSONObject
@@ -179,6 +183,17 @@ private class LocalStore(context: Context) {
         val array = JSONArray()
         items.forEach { item -> array.put(JSONObject().apply { put("id", item.id); put("novelId", item.novelId); put("novelTitle", item.novelTitle); put("kind", item.kind); put("title", item.title); put("content", item.content); put("volumeId", item.volumeId); put("status", item.status) }) }
         trashPrefs.edit().putString("data", array.toString()).apply()
+    }
+
+    fun backupProjectSnapshot(json: String): String? {
+        return runCatching {
+            val dir = File(context.filesDir, "sync_backups")
+            dir.mkdirs()
+            val file = File(dir, "backup_${System.currentTimeMillis()}.lnw")
+            file.writeText(json, Charsets.UTF_8)
+            dir.listFiles()?.sortedByDescending { it.lastModified() }?.drop(5)?.forEach { it.delete() }
+            file.absolutePath
+        }.getOrNull()
     }
 
     private fun todayKey(): String = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
@@ -334,6 +349,7 @@ private class LanSyncManager(
     @Volatile var lastMessage: String = "尚未同步"
         private set
 
+
     fun localAddress(): String? {
         return runCatching {
             NetworkInterface.getNetworkInterfaces().asSequence()
@@ -387,7 +403,7 @@ private class LanSyncManager(
             val method = requestLine.substringBefore(' ')
             val path = requestLine.substringAfter(' ').substringBefore(' ')
             if (method == "GET" && path == "/api/info") {
-                writeResponse(s, 200, JSONObject().apply { put("app", "LocalNovelWriter"); put("version", "2.5"); put("port", 38471) }.toString())
+                writeResponse(s, 200, JSONObject().apply { put("app", "LocalNovelWriter"); put("version", "2.6"); put("port", 38471) }.toString())
                 return
             }
             if (method == "GET" && path == "/api/project") {
@@ -429,10 +445,45 @@ private class LanSyncManager(
         socket.getOutputStream().flush()
     }
 
+    suspend fun discoverComputers(): List<String> = withContext(Dispatchers.IO) {
+        val ip = localAddress() ?: return@withContext emptyList()
+        val parts = ip.split('.')
+        if (parts.size != 4) return@withContext emptyList()
+        val prefix = parts.take(3).joinToString(".")
+        val found = mutableListOf<String>()
+        for (start in 1..254 step 32) {
+            val jobs = (start until minOf(start + 32, 255)).map { host ->
+                async {
+                    val base = "http://$prefix.$host:38471"
+                    runCatching {
+                        val url = URL(base + "/api/info")
+                        val conn = (url.openConnection() as HttpURLConnection).apply {
+                            requestMethod = "GET"; connectTimeout = 220; readTimeout = 350
+                        }
+                        val body = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+                        conn.disconnect()
+                        val obj = JSONObject(body)
+                        if (obj.optString("app") == "LocalNovelWriter" && obj.optString("platform") == "windows") base else null
+                    }.getOrNull()
+                }
+            }
+            jobs.awaitAll().forEach { it?.let(found::add) }
+        }
+        found.distinct()
+    }
+
     suspend fun pullFromComputer(baseUrl: String): Result<String> = runCatching {
         val url = URL(baseUrl.trimEnd('/') + "/api/project")
         val conn = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"; connectTimeout = 5000; readTimeout = 15000
+        }
+        conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }.also { conn.disconnect() }
+    }
+
+    suspend fun testComputer(baseUrl: String): Result<String> = runCatching {
+        val url = URL(baseUrl.trimEnd('/') + "/api/info")
+        val conn = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"; connectTimeout = 3000; readTimeout = 3000
         }
         conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }.also { conn.disconnect() }
     }
@@ -458,6 +509,8 @@ private fun NovelApp(context: Context) {
     var syncUrl by remember { mutableStateOf("") }
     var syncMessage by remember { mutableStateOf("") }
     var syncBusy by remember { mutableStateOf(false) }
+    var syncFound by remember { mutableStateOf<List<String>>(emptyList()) }
+    var syncBackupMessage by remember { mutableStateOf("") }
     DisposableEffect(Unit) { onDispose { syncManager.stop() } }
     var novels by remember { mutableStateOf(store.load()) }
     var trash by remember { mutableStateOf(store.loadTrash()) }
@@ -483,6 +536,8 @@ private fun NovelApp(context: Context) {
     }
 
     var pendingProjectJson by remember { mutableStateOf<String?>(null) }
+    fun snapshotJson(): String = projectToJson(novels, trash)
+
     val projectExportLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/octet-stream")
     ) { uri ->
@@ -497,6 +552,7 @@ private fun NovelApp(context: Context) {
     ) { uri ->
         if (uri != null) runCatching {
             val data = context.contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: return@runCatching
+            store.backupProjectSnapshot(snapshotJson())
             val snapshot = projectFromJson(data)
             novels = snapshot.novels
             trash = snapshot.trash
@@ -536,10 +592,9 @@ private fun NovelApp(context: Context) {
         store.save(novels)
     }
 
-    fun snapshotJson(): String = projectToJson(novels, trash)
-
     fun importSnapshot(json: String) {
         runCatching {
+            store.backupProjectSnapshot(snapshotJson())
             val snapshot = projectFromJson(json)
             novels = snapshot.novels
             trash = snapshot.trash
@@ -753,8 +808,12 @@ private fun NovelApp(context: Context) {
             onUrlChange = { syncUrl = it },
             message = syncMessage,
             onMessageChange = { syncMessage = it },
+            foundComputers = syncFound,
+            onFoundComputers = { syncFound = it },
             busy = syncBusy,
             onBusyChange = { syncBusy = it },
+            backupMessage = syncBackupMessage,
+            onBackupMessage = { syncBackupMessage = it },
             onClose = { syncDialog = false }
         )
     }
@@ -770,12 +829,17 @@ private fun SyncCenterDialog(
     onUrlChange: (String) -> Unit,
     message: String,
     onMessageChange: (String) -> Unit,
+    foundComputers: List<String>,
+    onFoundComputers: (List<String>) -> Unit,
     busy: Boolean,
     onBusyChange: (Boolean) -> Unit,
+    backupMessage: String,
+    onBackupMessage: (String) -> Unit,
     onClose: () -> Unit
 ) {
     val scope = rememberCoroutineScope()
     var running by remember { mutableStateOf(manager.running) }
+    var pendingIncoming by remember { mutableStateOf<String?>(null) }
     AlertDialog(
         onDismissRequest = onClose,
         title = { Text("设备联动") },
@@ -797,7 +861,33 @@ private fun SyncCenterDialog(
                     }
                 }
                 HorizontalDivider()
-                Text("连接电脑", fontWeight = FontWeight.Bold)
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text("连接电脑", fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                    OutlinedButton(enabled = !busy, onClick = {
+                        onBusyChange(true); onMessageChange("正在搜索同一 Wi-Fi 下的电脑……")
+                        scope.launch {
+                            val found = manager.discoverComputers()
+                            onFoundComputers(found)
+                            onMessageChange(if (found.isEmpty()) "没有发现电脑，请确认电脑端已开启手机联动并且两台设备在同一 Wi-Fi。" else "发现 ${found.size} 台电脑")
+                            if (found.size == 1) onUrlChange(found.first())
+                            onBusyChange(false)
+                        }
+                    }) {
+                        Icon(Icons.Default.Search, null); Spacer(Modifier.width(4.dp)); Text("搜索电脑")
+                    }
+                }
+                if (foundComputers.isNotEmpty()) {
+                    foundComputers.forEach { address ->
+                        Card(Modifier.fillMaxWidth().clickable { onUrlChange(address) }) {
+                            Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Icon(Icons.Default.Computer, null)
+                                Spacer(Modifier.width(8.dp))
+                                Text(address, modifier = Modifier.weight(1f))
+                                Text("选择", color = MaterialTheme.colorScheme.primary)
+                            }
+                        }
+                    }
+                }
                 OutlinedTextField(
                     value = url,
                     onValueChange = onUrlChange,
@@ -807,22 +897,74 @@ private fun SyncCenterDialog(
                 )
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedButton(enabled = !busy && url.isNotBlank(), onClick = {
-                        onBusyChange(true); onMessageChange("正在从电脑读取项目……")
+                        onBusyChange(true); onMessageChange("正在测试电脑连接……")
+                        scope.launch {
+                            val result = manager.testComputer(url)
+                            result.onSuccess { onMessageChange("电脑连接成功：$it") }.onFailure { onMessageChange("连接失败：${it.message ?: "连接失败"}") }
+                            onBusyChange(false)
+                        }
+                    }, modifier = Modifier.weight(1f)) { Text("测试连接") }
+                    OutlinedButton(enabled = !busy && url.isNotBlank(), onClick = {
+                        onBusyChange(true); onMessageChange("正在读取电脑项目……")
                         scope.launch {
                             val result = manager.pullFromComputer(url)
-                            result.onSuccess { onImportSnapshot(it) }.onFailure { onMessageChange("读取失败：${it.message ?: "连接失败"}") }
+                            result.onSuccess {
+                                onMessageChange("已读取电脑项目，请确认后覆盖手机。")
+                                onMessageChange("电脑项目已读取；为防止丢稿，确认后会先自动备份手机当前项目。")
+                                onFoundComputers(foundComputers)
+                                // 通过临时状态交给外层无法直接传递，因此使用 manager 暂存。
+                                pendingIncoming = it
+                            }.onFailure { onMessageChange("读取失败：${it.message ?: "连接失败"}") }
                             onBusyChange(false)
                         }
                     }, modifier = Modifier.weight(1f)) { Text("电脑 → 手机") }
-                    Button(enabled = !busy && url.isNotBlank(), onClick = {
-                        onBusyChange(true); onMessageChange("正在发送项目到电脑……")
+                }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(enabled = !busy && url.isNotBlank(), onClick = {
+                        onBusyChange(true); onMessageChange("正在发送手机项目到电脑……")
                         scope.launch {
                             val result = manager.pushToComputer(url, snapshotProvider())
                             result.onSuccess { onMessageChange("同步完成：电脑已收到手机项目") }.onFailure { onMessageChange("发送失败：${it.message ?: "连接失败"}") }
                             onBusyChange(false)
                         }
                     }, modifier = Modifier.weight(1f)) { Text("手机 → 电脑") }
+                    Button(enabled = !busy && url.isNotBlank(), onClick = {
+                        onBusyChange(true); onMessageChange("正在进行双向同步……先把手机项目发送给电脑，再读取电脑合并结果。")
+                        scope.launch {
+                            val pushed = manager.pushToComputer(url, snapshotProvider())
+                            if (pushed.isFailure) {
+                                onMessageChange("双向同步失败：${pushed.exceptionOrNull()?.message ?: "发送失败"}")
+                            } else {
+                                val pulled = manager.pullFromComputer(url)
+                                pulled.onSuccess { pendingIncoming = it; onMessageChange("电脑已合并手机项目，确认后将把合并结果写回手机。") }
+                                    .onFailure { onMessageChange("读取合并结果失败：${it.message ?: "连接失败"}") }
+                            }
+                            onBusyChange(false)
+                        }
+                    }, modifier = Modifier.weight(1f)) { Text("双向智能同步") }
                 }
+                if (pendingIncoming != null) {
+                    Card(Modifier.fillMaxWidth()) {
+                        Column(Modifier.padding(12.dp)) {
+                            Text("发现待处理的电脑项目", fontWeight = FontWeight.Bold)
+                            Spacer(Modifier.height(4.dp))
+                            Text("手机当前项目会先自动备份，再应用电脑项目。", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Spacer(Modifier.height(8.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Button(onClick = {
+                                    val incoming = pendingIncoming
+                                    if (incoming != null) {
+                                        onImportSnapshot(incoming)
+                                        onBackupMessage("已自动备份手机当前项目")
+                                        pendingIncoming = null
+                                    }
+                                }, modifier = Modifier.weight(1f)) { Text("应用并备份") }
+                                OutlinedButton(onClick = { pendingIncoming = null; onMessageChange("已取消应用电脑项目") }, modifier = Modifier.weight(1f)) { Text("取消") }
+                            }
+                        }
+                    }
+                }
+                if (backupMessage.isNotBlank()) Text(backupMessage, color = MaterialTheme.colorScheme.primary, fontSize = 12.sp)
                 if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
                 if (message.isNotBlank()) Text(message, color = MaterialTheme.colorScheme.primary, fontSize = 13.sp)
                 Text("建议：每次同步前保留一份完整项目备份。发生冲突时，先不要覆盖双方数据。", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -854,20 +996,29 @@ private fun HomeScreen(
 ) {
     val orientation = androidx.compose.ui.platform.LocalConfiguration.current.orientation
     var deleteTarget by remember { mutableStateOf<Novel?>(null) }
+    val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
+    val drawerScope = rememberCoroutineScope()
+    ModalNavigationDrawer(
+        drawerState = drawerState,
+        drawerContent = {
+            ModalDrawerSheet {
+                Text("本地小说 v2.6", modifier = Modifier.padding(24.dp, 22.dp, 24.dp, 12.dp), fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                HorizontalDivider()
+                NavigationDrawerItem(label = { Text("导入小说") }, selected = false, onClick = { drawerScope.launch { drawerState.close() }; onImport() }, icon = { Icon(Icons.Default.FileOpen, null) })
+                NavigationDrawerItem(label = { Text("设备联动") }, selected = false, onClick = { drawerScope.launch { drawerState.close() }; onOpenSync() }, icon = { Icon(Icons.Default.Sync, null) })
+                NavigationDrawerItem(label = { Text("导出完整项目") }, selected = false, onClick = { drawerScope.launch { drawerState.close() }; onExportProject() }, icon = { Icon(Icons.Default.Archive, null) })
+                NavigationDrawerItem(label = { Text("导入完整项目") }, selected = false, onClick = { drawerScope.launch { drawerState.close() }; onImportProject() }, icon = { Icon(Icons.Default.Unarchive, null) })
+                HorizontalDivider(Modifier.padding(vertical = 8.dp))
+                NavigationDrawerItem(label = { Text(if (orientation == Configuration.ORIENTATION_LANDSCAPE) "切换为竖屏" else "切换为横屏") }, selected = false, onClick = { drawerScope.launch { drawerState.close() }; onToggleOrientation() }, icon = { Icon(if (orientation == Configuration.ORIENTATION_LANDSCAPE) Icons.Default.StayCurrentPortrait else Icons.Default.ScreenRotation, null) })
+                NavigationDrawerItem(label = { Text(if (dark) "切换为浅色模式" else "切换为深色模式") }, selected = false, onClick = { drawerScope.launch { drawerState.close() }; onDark() }, icon = { Icon(if (dark) Icons.Default.LightMode else Icons.Default.DarkMode, null) })
+            }
+        }
+    ) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("本地小说 v2.5", fontWeight = FontWeight.Bold) },
-                actions = {
-                    if (dockTab == "books") {
-                        IconButton(onClick = onImport) { Icon(Icons.Default.FileOpen, "导入小说") }
-                        IconButton(onClick = onOpenSync) { Icon(Icons.Default.Sync, "设备联动") }
-                        IconButton(onClick = onExportProject) { Icon(Icons.Default.Archive, "导出完整项目") }
-                        IconButton(onClick = onImportProject) { Icon(Icons.Default.Unarchive, "导入完整项目") }
-                    }
-                    IconButton(onClick = onToggleOrientation) { Icon(if (orientation == Configuration.ORIENTATION_LANDSCAPE) Icons.Default.StayCurrentPortrait else Icons.Default.ScreenRotation, "切换横竖屏") }
-                    IconButton(onClick = onDark) { Icon(if (dark) Icons.Default.LightMode else Icons.Default.DarkMode, null) }
-                }
+                navigationIcon = { IconButton(onClick = { drawerScope.launch { drawerState.open() } }) { Icon(Icons.Default.Menu, "打开侧边栏") } },
+                title = { Text("本地小说 v2.6", fontWeight = FontWeight.Bold) }
             )
         },
         bottomBar = { HomeDock(dockTab, onDockTab) },
@@ -925,6 +1076,7 @@ private fun HomeScreen(
             confirmButton = { TextButton(onClick = { deleteTarget?.let { onDelete(it.id) }; deleteTarget = null }) { Text("移入回收站") } },
             dismissButton = { TextButton(onClick = { deleteTarget = null }) { Text("取消") } })
     }
+    }
 }
 
 @Composable
@@ -932,7 +1084,7 @@ private fun AnnouncementScreen() {
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(18.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
         item { Text("公告栏", fontSize = 28.sp, fontWeight = FontWeight.Bold) }
         item { Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(18.dp)) { Text("📌 永久公告", fontWeight = FontWeight.Bold, fontSize = 20.sp); Spacer(Modifier.height(8.dp)); Text("每次更新 App 前，请先在应用内导出小说备份。\n\n建议同时保留 TXT 备份与完整的本地数据备份。更新过程中不要卸载旧版本，以免丢失本地数据。") } } }
-        item { Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(18.dp)) { Text("V2.5 更新", fontWeight = FontWeight.Bold, fontSize = 20.sp); Spacer(Modifier.height(8.dp)); Text("新增设备联动基础功能，支持手机与电脑通过局域网进行双向同步，并加入完整小说项目 .lnw 导入与导出，为后续电脑端联动做好准备。") } } }
+        item { Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(18.dp)) { Text("V2.6 更新", fontWeight = FontWeight.Bold, fontSize = 20.sp); Spacer(Modifier.height(8.dp)); Text("完善手机与电脑局域网双向同步，加入电脑自动发现、连接测试、双向智能同步、同步前自动备份与同步结果确认；同时将首页顶部功能收进左侧隐藏式侧边栏，让顶部更简洁。") } } }
         item { Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(18.dp)) { Text("本地数据", fontWeight = FontWeight.Bold, fontSize = 20.sp); Spacer(Modifier.height(8.dp)); Text("小说内容继续保存在手机本地，不需要账号，也不会上传服务器。") } } }
         item { Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(18.dp)) { Text("更新提示", fontWeight = FontWeight.Bold, fontSize = 20.sp); Spacer(Modifier.height(8.dp)); Text("以后更新请直接安装新 APK，不要先卸载旧版本。") } } }
     }
