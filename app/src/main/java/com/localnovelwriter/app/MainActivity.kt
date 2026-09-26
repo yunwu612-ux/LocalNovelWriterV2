@@ -19,12 +19,8 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.animation.AnimatedContent
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.slideInHorizontally
-import androidx.compose.animation.slideOutHorizontally
-import androidx.compose.animation.togetherWith
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -211,6 +207,10 @@ private class LocalStore(context: Context) {
         if (delta > 0L) statsPrefs.edit().putLong("weekWords", statsPrefs.getLong("weekWords", 0L) + delta).putLong("day_$today", statsPrefs.getLong("day_$today", 0L) + delta).putLong("lastTotal", total).apply()
         else if (statsPrefs.getLong("lastTotal", Long.MIN_VALUE) == Long.MIN_VALUE) statsPrefs.edit().putLong("lastTotal", total).apply()
     }
+    fun totalWordCount(novels: List<Novel>): Int = novels.sumOf { n ->
+        n.chapters.sumOf { chapter -> chapter.content.count { ch -> !ch.isWhitespace() } }
+    }
+
     fun weeklyWords(): Long = statsPrefs.getLong("weekWords", 0L)
     fun todayWords(): Long = statsPrefs.getLong("day_${todayKey()}", 0L)
     fun weeklyGoal(): Int = statsPrefs.getInt("weeklyGoal", 5000)
@@ -589,6 +589,7 @@ private fun NovelApp(context: Context) {
         store.save(novels)
         store.saveTrash(trash)
         store.recordWordProgress(novels)
+        totalWords = store.totalWordCount(novels)
     }
 
     // Editor autosave intentionally skips the full-library word-count scan.
@@ -662,7 +663,7 @@ private fun NovelApp(context: Context) {
 
     val novel = novels.firstOrNull { it.id == novelId }
     val chapter = novel?.chapters?.firstOrNull { it.id == chapterId }
-    val totalWords = novels.sumOf { n -> n.chapters.sumOf { it.content.count { ch -> !ch.isWhitespace() } } }
+    var totalWords by remember { mutableIntStateOf(store.totalWordCount(novels)) }
 
     BackHandler {
         when {
@@ -684,14 +685,7 @@ private fun NovelApp(context: Context) {
             worldId != null -> "world:$novelId:$worldId"
             else -> "novel:$novelId:$section"
         }
-        AnimatedContent(
-            targetState = screenToken,
-            transitionSpec = {
-                (fadeIn(animationSpec = tween(160)) + slideInHorizontally(animationSpec = tween(160)) { it / 14 })
-                    .togetherWith(fadeOut(animationSpec = tween(110)) + slideOutHorizontally(animationSpec = tween(110)) { -it / 18 })
-            },
-            label = "pageTransition"
-        ) { _ ->
+        PageEnterTransition(screenToken) {
             when {
             novelId == null -> HomeScreen(
                     novels = novels,
@@ -989,6 +983,35 @@ private fun HomeDock(selected: String, onSelected: (String) -> Unit) {
     }
 }
 
+@Composable
+private fun PageEnterTransition(
+    token: String,
+    distanceDp: Float = 18f,
+    duration: Int = 170,
+    content: @Composable () -> Unit
+) {
+    val alpha = remember(token) { Animatable(0.96f) }
+    val offset = remember(token) { Animatable(distanceDp) }
+
+    LaunchedEffect(token) {
+        kotlinx.coroutines.coroutineScope {
+            launch { alpha.animateTo(1f, tween(duration, easing = FastOutSlowInEasing)) }
+            launch { offset.animateTo(0f, tween(duration, easing = FastOutSlowInEasing)) }
+        }
+    }
+
+    Box(
+        Modifier
+            .fillMaxSize()
+            .graphicsLayer {
+                this.alpha = alpha.value
+                translationX = offset.value.dp.toPx()
+            }
+    ) {
+        content()
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun HomeScreen(
@@ -1007,7 +1030,7 @@ private fun HomeScreen(
         drawerState = drawerState,
         drawerContent = {
             ModalDrawerSheet {
-                Text("本地小说 v2.6", modifier = Modifier.padding(24.dp, 22.dp, 24.dp, 12.dp), fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                Text("本地小说 v2.6.1", modifier = Modifier.padding(24.dp, 22.dp, 24.dp, 12.dp), fontSize = 22.sp, fontWeight = FontWeight.Bold)
                 HorizontalDivider()
                 NavigationDrawerItem(label = { Text("导入小说") }, selected = false, onClick = { drawerScope.launch { drawerState.close() }; onImport() }, icon = { Icon(Icons.Default.FileOpen, null) })
                 NavigationDrawerItem(label = { Text("设备联动") }, selected = false, onClick = { drawerScope.launch { drawerState.close() }; onOpenSync() }, icon = { Icon(Icons.Default.Sync, null) })
@@ -1023,7 +1046,7 @@ private fun HomeScreen(
         topBar = {
             TopAppBar(
                 navigationIcon = { IconButton(onClick = { drawerScope.launch { drawerState.open() } }) { Icon(Icons.Default.Menu, "打开侧边栏") } },
-                title = { Text("本地小说 v2.6", fontWeight = FontWeight.Bold) }
+                title = { Text("本地小说 v2.6.1", fontWeight = FontWeight.Bold) }
             )
         },
         bottomBar = { HomeDock(dockTab, onDockTab) },
@@ -1031,24 +1054,17 @@ private fun HomeScreen(
     ) { padding ->
         // 底部标签保留轻量横向切换动效；LazyColumn 本身不做动画。
         Box(Modifier.fillMaxSize().padding(padding)) {
-            AnimatedContent(
-                targetState = dockTab,
-                transitionSpec = {
-                    (fadeIn(tween(140)) + slideInHorizontally(tween(140)) { it / 20 })
-                        .togetherWith(fadeOut(tween(100)) + slideOutHorizontally(tween(100)) { -it / 24 })
-                },
-                label = "homeTabTransition"
-            ) { tab ->
-            when (tab) {
+            PageEnterTransition("home:$dockTab", distanceDp = 10f, duration = 130) {
+            when (dockTab) {
                 "books" -> {
                     if (novels.isEmpty()) Box(Modifier.fillMaxSize(), Alignment.Center) { Text("还没有小说\n点击右下角 + 开始写作", fontSize = 20.sp) }
                     else LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         items(novels, key = { it.id }) { n ->
                             var menu by remember(n.id) { mutableStateOf(false) }
-                            Card(Modifier.fillMaxWidth()) {
+                            Card(onClick = { onOpen(n.id) }, modifier = Modifier.fillMaxWidth()) {
                                 Column(Modifier.padding(18.dp)) {
                                     Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Column(Modifier.weight(1f).clickable { onOpen(n.id) }) {
+                                        Column(Modifier.weight(1f)) {
                                             Text(n.title, fontSize = 20.sp, fontWeight = FontWeight.Bold)
                                             Spacer(Modifier.height(6.dp))
                                             Text("${n.volumes.size} 卷 · ${n.chapters.size} 章 · ${n.characters.size} 人物 · ${n.worlds.size} 世界资料")
@@ -1089,7 +1105,7 @@ private fun AnnouncementScreen() {
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(18.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
         item { Text("公告栏", fontSize = 28.sp, fontWeight = FontWeight.Bold) }
         item { Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(18.dp)) { Text("📌 永久公告", fontWeight = FontWeight.Bold, fontSize = 20.sp); Spacer(Modifier.height(8.dp)); Text("每次更新 App 前，请先在应用内导出小说备份。\n\n建议同时保留 TXT 备份与完整的本地数据备份。更新过程中不要卸载旧版本，以免丢失本地数据。") } } }
-        item { Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(18.dp)) { Text("V2.6 更新", fontWeight = FontWeight.Bold, fontSize = 20.sp); Spacer(Modifier.height(8.dp)); Text("完善手机与电脑局域网双向同步，加入电脑自动发现、连接测试、双向智能同步、同步前自动备份与同步结果确认；同时将首页顶部功能收进左侧隐藏式侧边栏，让顶部更简洁。") } } }
+        item { Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(18.dp)) { Text("V2.6.1 更新", fontWeight = FontWeight.Bold, fontSize = 20.sp); Spacer(Modifier.height(8.dp)); Text("完善手机与电脑局域网双向同步，加入电脑自动发现、连接测试、双向智能同步、同步前自动备份与同步结果确认；同时将首页顶部功能收进左侧隐藏式侧边栏，让顶部更简洁。") } } }
         item { Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(18.dp)) { Text("本地数据", fontWeight = FontWeight.Bold, fontSize = 20.sp); Spacer(Modifier.height(8.dp)); Text("小说内容继续保存在手机本地，不需要账号，也不会上传服务器。") } } }
         item { Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(18.dp)) { Text("更新提示", fontWeight = FontWeight.Bold, fontSize = 20.sp); Spacer(Modifier.height(8.dp)); Text("以后更新请直接安装新 APK，不要先卸载旧版本。") } } }
     }
