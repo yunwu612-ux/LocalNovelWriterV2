@@ -31,6 +31,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.Color
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -62,8 +64,15 @@ private data class Chapter(
     var title: String,
     var content: String,
     var volumeId: Long = 0L,
-    var status: String = "草稿"
+    var status: String = "草稿",
+    // Runtime-only cache; excluded from project JSON.
+    var cachedWordCount: Int = -1
 )
+private fun Chapter.wordCount(): Int {
+    if (cachedWordCount < 0) cachedWordCount = content.count { !it.isWhitespace() }
+    return cachedWordCount
+}
+
 private data class CharacterProfile(
     val id: Long,
     var name: String,
@@ -155,6 +164,10 @@ private class LocalStore(context: Context) {
     } catch (_: Exception) { mutableListOf() }
 
     fun save(novels: List<Novel>) {
+        saveSerialized(serialize(novels))
+    }
+
+    fun serialize(novels: List<Novel>): String {
         val array = JSONArray()
         novels.forEach { novel ->
             val o = JSONObject().apply {
@@ -166,7 +179,11 @@ private class LocalStore(context: Context) {
             }
             array.put(o)
         }
-        prefs.edit().putString("data", array.toString()).apply()
+        return array.toString()
+    }
+
+    fun saveSerialized(json: String) {
+        prefs.edit().putString("data", json).apply()
     }
 
     fun loadTrash(): MutableList<TrashItem> = try {
@@ -589,17 +606,35 @@ private fun NovelApp(context: Context) {
     // Keep this state declared before local save() so the local function can capture it.
     var totalWords by remember { mutableIntStateOf(store.totalWordCount(novels)) }
 
+    val editorSaveScope = rememberCoroutineScope()
+    var editorSaveRevision by remember { mutableLongStateOf(0L) }
+
     fun save() {
+        // Invalidate any background autosave so it cannot overwrite this newer snapshot.
+        editorSaveRevision += 1L
         store.save(novels)
         store.saveTrash(trash)
         store.recordWordProgress(novels)
         totalWords = store.totalWordCount(novels)
     }
 
-    // Editor autosave intentionally skips the full-library word-count scan.
-    // The final save when leaving the editor still records statistics.
+    // Snapshot lightweight model lists on the UI thread, then serialize off-thread.
+    // A revision check prevents an older autosave from overwriting a newer save.
     fun saveEditorContent() {
-        store.save(novels)
+        val revision = ++editorSaveRevision
+        val snapshot = novels.map { n ->
+            Novel(
+                n.id, n.title,
+                n.chapters.map { it.copy() }.toMutableList(),
+                n.characters.map { it.copy() }.toMutableList(),
+                n.worlds.map { it.copy() }.toMutableList(),
+                n.volumes.map { it.copy() }.toMutableList()
+            )
+        }
+        editorSaveScope.launch {
+            val json = withContext(Dispatchers.Default) { store.serialize(snapshot) }
+            if (revision == editorSaveRevision) store.saveSerialized(json)
+        }
     }
 
     fun importSnapshot(json: String) {
@@ -677,11 +712,24 @@ private fun NovelApp(context: Context) {
         }
     }
 
-    MaterialTheme(colorScheme = if (dark) darkColorScheme() else lightColorScheme()) {
+    MaterialTheme(
+        colorScheme = if (dark) darkColorScheme(
+            primary = Color(0xFFB9B7FF),
+            secondary = Color(0xFF8DD8CC),
+            surface = Color(0xFF171923),
+            background = Color(0xFF101116)
+        ) else lightColorScheme(
+            primary = Color(0xFF5655C7),
+            secondary = Color(0xFF287E78),
+            background = Color(0xFFF6F7FC),
+            surface = Color(0xFFFFFFFF),
+            surfaceVariant = Color(0xFFECEEF8)
+        )
+    ) {
         // 恢复轻量页面动效：只对“页面入口/退出”做 160ms 的淡入 + 小幅滑动，
         // 列表、编辑器和卡片内部不做持续动画，避免 V2.4 那种大范围动画带来的卡顿。
         val screenToken = when {
-            novelId == null -> "home:$dockTab"
+            novelId == null -> "home"
             chapterId != null -> "chapter:$novelId:$chapterId"
             characterId != null -> "character:$novelId:$characterId"
             worldId != null -> "world:$novelId:$worldId"
@@ -758,7 +806,12 @@ private fun NovelApp(context: Context) {
                     chapter = chapter,
                     novelTitle = novel.title,
                     onBack = { chapterId = null; save() },
-                    onSave = { title, content -> chapter.title = title; chapter.content = content; saveEditorContent() }
+                    onSave = { title, content ->
+                        chapter.title = title
+                        if (chapter.content != content) chapter.cachedWordCount = -1
+                        chapter.content = content
+                        saveEditorContent()
+                    }
                 )
                 characterId != null && novel != null -> novel.characters.firstOrNull { it.id == characterId }?.let { CharacterEditor(it) { characterId = null; save() } }
                 worldId != null && novel != null -> novel.worlds.firstOrNull { it.id == worldId }?.let { WorldEditor(it) { worldId = null; save() } }
@@ -1032,7 +1085,7 @@ private fun HomeScreen(
         drawerState = drawerState,
         drawerContent = {
             ModalDrawerSheet {
-                Text("本地小说 v2.6.1", modifier = Modifier.padding(24.dp, 22.dp, 24.dp, 12.dp), fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                Text("本地小说 V3.0", modifier = Modifier.padding(24.dp, 22.dp, 24.dp, 12.dp), fontSize = 22.sp, fontWeight = FontWeight.Bold)
                 HorizontalDivider()
                 NavigationDrawerItem(label = { Text("导入小说") }, selected = false, onClick = { drawerScope.launch { drawerState.close() }; onImport() }, icon = { Icon(Icons.Default.FileOpen, null) })
                 NavigationDrawerItem(label = { Text("设备联动") }, selected = false, onClick = { drawerScope.launch { drawerState.close() }; onOpenSync() }, icon = { Icon(Icons.Default.Sync, null) })
@@ -1048,7 +1101,7 @@ private fun HomeScreen(
         topBar = {
             TopAppBar(
                 navigationIcon = { IconButton(onClick = { drawerScope.launch { drawerState.open() } }) { Icon(Icons.Default.Menu, "打开侧边栏") } },
-                title = { Text("本地小说 v2.6.1", fontWeight = FontWeight.Bold) }
+                title = { Text("本地小说 V3.0", fontWeight = FontWeight.Bold) }
             )
         },
         bottomBar = { HomeDock(dockTab, onDockTab) },
@@ -1059,29 +1112,81 @@ private fun HomeScreen(
             PageEnterTransition("home:$dockTab", distanceDp = 10f, duration = 130) {
             when (dockTab) {
                 "books" -> {
-                    if (novels.isEmpty()) Box(Modifier.fillMaxSize(), Alignment.Center) { Text("还没有小说\n点击右下角 + 开始写作", fontSize = 20.sp) }
-                    else LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        items(novels, key = { it.id }) { n ->
-                            var menu by remember(n.id) { mutableStateOf(false) }
-                            Card(onClick = { onOpen(n.id) }, modifier = Modifier.fillMaxWidth()) {
-                                Column(Modifier.padding(18.dp)) {
+                    LazyColumn(
+                        Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 92.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        item(key = "library_header") {
+                            Card(
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(26.dp),
+                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
+                            ) {
+                                Column(Modifier.padding(20.dp)) {
                                     Row(verticalAlignment = Alignment.CenterVertically) {
                                         Column(Modifier.weight(1f)) {
-                                            Text(n.title, fontSize = 20.sp, fontWeight = FontWeight.Bold)
-                                            Spacer(Modifier.height(6.dp))
-                                            Text("${n.volumes.size} 卷 · ${n.chapters.size} 章 · ${n.characters.size} 人物 · ${n.worlds.size} 世界资料")
+                                            Text("我的书架", fontSize = 26.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onPrimaryContainer)
+                                            Spacer(Modifier.height(4.dp))
+                                            Text("把灵感整理成故事", color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.78f))
                                         }
-                                        Box {
-                                            IconButton(onClick = { menu = true }) { Icon(Icons.Default.MoreVert, "更多") }
-                                            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                                                DropdownMenuItem(text = { Text("导出整本") }, leadingIcon = { Icon(Icons.Default.FileDownload, null) }, onClick = { menu = false; onExport(n) })
-                                                DropdownMenuItem(text = { Text("删除小说") }, leadingIcon = { Icon(Icons.Default.Delete, null) }, onClick = { menu = false; deleteTarget = n })
-                                            }
+                                        Icon(Icons.Default.AutoStories, null, modifier = Modifier.size(38.dp), tint = MaterialTheme.colorScheme.onPrimaryContainer)
+                                    }
+                                    Spacer(Modifier.height(16.dp))
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        LibraryMetric("小说", novels.size)
+                                        LibraryMetric("章节", novels.sumOf { it.chapters.size })
+                                        LibraryMetric("人物", novels.sumOf { it.characters.size })
+                                    }
+                                }
+                            }
+                        }
+                        if (novels.isEmpty()) {
+                            item(key = "empty_library") {
+                                Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(22.dp)) {
+                                    Column(Modifier.fillMaxWidth().padding(28.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                                        Icon(Icons.Default.AutoStories, null, modifier = Modifier.size(46.dp), tint = MaterialTheme.colorScheme.primary)
+                                        Spacer(Modifier.height(12.dp))
+                                        Text("书架还是空的", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                                        Text("创建第一本小说，开始你的故事。", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                        Spacer(Modifier.height(14.dp))
+                                        Button(onClick = onNew) { Icon(Icons.Default.Add, null); Spacer(Modifier.width(6.dp)); Text("新建小说") }
+                                    }
+                                }
+                            }
+                        } else items(novels, key = { it.id }) { n ->
+                            var menu by remember(n.id) { mutableStateOf(false) }
+                            Card(
+                                onClick = { onOpen(n.id) },
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(22.dp),
+                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+                            ) {
+                                Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                                    Surface(
+                                        shape = RoundedCornerShape(16.dp),
+                                        color = MaterialTheme.colorScheme.secondaryContainer,
+                                        modifier = Modifier.size(54.dp)
+                                    ) {
+                                        Box(contentAlignment = Alignment.Center) {
+                                            Icon(Icons.Default.MenuBook, null, tint = MaterialTheme.colorScheme.onSecondaryContainer, modifier = Modifier.size(28.dp))
                                         }
                                     }
-                                    Spacer(Modifier.height(8.dp))
-                                    val count = n.chapters.sumOf { it.content.count { ch -> !ch.isWhitespace() } }
-                                    Text("$count 字", fontSize = 13.sp, color = MaterialTheme.colorScheme.primary)
+                                    Spacer(Modifier.width(14.dp))
+                                    Column(Modifier.weight(1f)) {
+                                        Text(n.title.ifBlank { "未命名小说" }, fontSize = 18.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+                                        Spacer(Modifier.height(7.dp))
+                                        Text("${n.volumes.size} 卷  ·  ${n.chapters.size} 章", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                        Spacer(Modifier.height(3.dp))
+                                        Text("${n.characters.size} 个人物  ·  ${n.worlds.size} 份世界资料", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    }
+                                    Box {
+                                        IconButton(onClick = { menu = true }) { Icon(Icons.Default.MoreVert, "更多") }
+                                        DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                                            DropdownMenuItem(text = { Text("导出整本") }, leadingIcon = { Icon(Icons.Default.FileDownload, null) }, onClick = { menu = false; onExport(n) })
+                                            DropdownMenuItem(text = { Text("删除小说") }, leadingIcon = { Icon(Icons.Default.Delete, null) }, onClick = { menu = false; deleteTarget = n })
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1103,11 +1208,25 @@ private fun HomeScreen(
 }
 
 @Composable
+private fun LibraryMetric(label: String, value: Int) {
+    Surface(
+        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.72f),
+        shape = RoundedCornerShape(14.dp)
+    ) {
+        Row(Modifier.padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(value.toString(), fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+            Spacer(Modifier.width(5.dp))
+            Text(label, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+}
+
+@Composable
 private fun AnnouncementScreen() {
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(18.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
         item { Text("公告栏", fontSize = 28.sp, fontWeight = FontWeight.Bold) }
         item { Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(18.dp)) { Text("📌 永久公告", fontWeight = FontWeight.Bold, fontSize = 20.sp); Spacer(Modifier.height(8.dp)); Text("每次更新 App 前，请先在应用内导出小说备份。\n\n建议同时保留 TXT 备份与完整的本地数据备份。更新过程中不要卸载旧版本，以免丢失本地数据。") } } }
-        item { Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(18.dp)) { Text("V2.6.1 更新", fontWeight = FontWeight.Bold, fontSize = 20.sp); Spacer(Modifier.height(8.dp)); Text("完善手机与电脑局域网双向同步，加入电脑自动发现、连接测试、双向智能同步、同步前自动备份与同步结果确认；同时将首页顶部功能收进左侧隐藏式侧边栏，让顶部更简洁。") } } }
+        item { Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(18.dp)) { Text("V3.0 更新", fontWeight = FontWeight.Bold, fontSize = 20.sp); Spacer(Modifier.height(8.dp)); Text("重绘书籍、章节、人物、世界观与写作页面；保留轻量页面过渡，优化长篇列表展示与页面渲染。") } } }
         item { Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(18.dp)) { Text("本地数据", fontWeight = FontWeight.Bold, fontSize = 20.sp); Spacer(Modifier.height(8.dp)); Text("小说内容继续保存在手机本地，不需要账号，也不会上传服务器。") } } }
         item { Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(18.dp)) { Text("更新提示", fontWeight = FontWeight.Bold, fontSize = 20.sp); Spacer(Modifier.height(8.dp)); Text("以后更新请直接安装新 APK，不要先卸载旧版本。") } } }
     }
@@ -1188,25 +1307,48 @@ private fun NovelScreen(
     var title by remember(novel.id) { mutableStateOf(novel.title) }
     var exportDialog by remember(novel.id) { mutableStateOf(false) }
     var search by remember(novel.id) { mutableStateOf("") }
+    var appliedSearch by remember(novel.id) { mutableStateOf("") }
+    LaunchedEffect(search) {
+        delay(220)
+        appliedSearch = if (search == " ") "" else search
+    }
     var selectedChapterIds by remember(novel.id) { mutableStateOf(novel.chapters.map { it.id }.toSet()) }
     var renameVolumeTarget by remember { mutableStateOf<Volume?>(null) }
     var deleteVolumeTarget by remember { mutableStateOf<Volume?>(null) }
     var volumeTitle by remember { mutableStateOf("") }
-    Scaffold(topBar = { TopAppBar(title = { Text(novel.title) }, actions = {
-        if (section == "chapters") IconButton(onClick = { search = if (search.isEmpty()) " " else "" }) { Icon(Icons.Default.Search, "搜索章节") }
-        IconButton(onClick = { exportDialog = true }) { Icon(Icons.Default.FileDownload, "导出") }
-        IconButton(onClick = { rename = true }) { Icon(Icons.Default.Edit, "重命名") }
-    }) }, floatingActionButton = { if (section == "chapters") FloatingActionButton(onClick = onAddChapter) { Icon(Icons.Default.Add, null) } }) { padding ->
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Column { Text(novel.title, maxLines = 1); Text("创作空间", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) } },
+                actions = {
+                    if (section == "chapters") IconButton(onClick = { search = if (search.isEmpty()) " " else "" }) { Icon(Icons.Default.Search, "搜索章节") }
+                    IconButton(onClick = { exportDialog = true }) { Icon(Icons.Default.FileDownload, "导出") }
+                    IconButton(onClick = { rename = true }) { Icon(Icons.Default.Edit, "重命名") }
+                }
+            )
+        },
+        floatingActionButton = {
+            if (section == "chapters") FloatingActionButton(onClick = onAddChapter, shape = RoundedCornerShape(18.dp)) { Icon(Icons.Default.Add, null) }
+            else if (section == "characters") FloatingActionButton(onClick = onAddCharacter, shape = RoundedCornerShape(18.dp)) { Icon(Icons.Default.PersonAdd, null) }
+            else FloatingActionButton(onClick = onAddWorld, shape = RoundedCornerShape(18.dp)) { Icon(Icons.Default.Public, null) }
+        }
+    ) { padding ->
         Column(Modifier.fillMaxSize().padding(padding)) {
-            Row(Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                FilterChip(section == "chapters", { onSection("chapters") }, label = { Text("章节") })
-                FilterChip(section == "characters", { onSection("characters") }, label = { Text("人物") })
-                FilterChip(section == "world", { onSection("world") }, label = { Text("世界") })
+            Card(
+                Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp),
+                shape = RoundedCornerShape(20.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+            ) {
+                Row(Modifier.fillMaxWidth().padding(8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    FilterChip(section == "chapters", { onSection("chapters") }, label = { Text("章节 ${novel.chapters.size}") }, leadingIcon = { Icon(Icons.Default.FormatListBulleted, null) })
+                    FilterChip(section == "characters", { onSection("characters") }, label = { Text("人物 ${novel.characters.size}") }, leadingIcon = { Icon(Icons.Default.Groups, null) })
+                    FilterChip(section == "world", { onSection("world") }, label = { Text("世界 ${novel.worlds.size}") }, leadingIcon = { Icon(Icons.Default.Public, null) })
+                }
             }
             when (section) {
                     "chapters" -> Column(Modifier.fillMaxSize()) {
                         if (search.isNotEmpty()) OutlinedTextField(value = if (search == " ") "" else search, onValueChange = { search = it }, singleLine = true, label = { Text("搜索章节标题或正文") }, leadingIcon = { Icon(Icons.Default.Search, null) }, trailingIcon = { IconButton(onClick = { search = "" }) { Icon(Icons.Default.Clear, null) } }, modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp))
-                        ChapterAndVolumeList(novel, onOpenChapter, onAddVolume, onRenameVolume = { id, t -> renameVolumeTarget = novel.volumes.firstOrNull { it.id == id }; volumeTitle = t }, onDeleteVolume = { id -> deleteVolumeTarget = novel.volumes.firstOrNull { it.id == id } }, onMoveChapter, onReorderChapters, onDeleteChapter, onStatusChange, if (search == " ") "" else search)
+                        ChapterAndVolumeList(novel, onOpenChapter, onAddVolume, onRenameVolume = { id, t -> renameVolumeTarget = novel.volumes.firstOrNull { it.id == id }; volumeTitle = t }, onDeleteVolume = { id -> deleteVolumeTarget = novel.volumes.firstOrNull { it.id == id } }, onMoveChapter, onReorderChapters, onDeleteChapter, onStatusChange, appliedSearch)
                     }
                     "characters" -> DataList(
                         items = novel.characters.map { it.id to it.name.ifBlank { "未命名人物" } },
@@ -1246,21 +1388,23 @@ private fun ChapterAndVolumeList(
     var menuChapter by remember { mutableStateOf<Chapter?>(null) }
     var statusChapter by remember { mutableStateOf<Chapter?>(null) }
     val normalizedSearch = searchQuery.trim()
-    val filteredChapters by remember(novel.id, searchQuery, novel.chapters.size) {
+    val chapterIdsInOrder = novel.chapters.map { it.id }
+    val chaptersByVolume by remember(novel.id, normalizedSearch, chapterIdsInOrder) {
         derivedStateOf {
-            if (normalizedSearch.isBlank()) novel.chapters
+            val filtered = if (normalizedSearch.isBlank()) novel.chapters.toList()
             else novel.chapters.filter { it.title.contains(normalizedSearch, ignoreCase = true) || it.content.contains(normalizedSearch, ignoreCase = true) }
+            filtered.groupBy { it.volumeId }
         }
     }
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        item { Card(Modifier.fillMaxWidth()) { Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("分卷", fontSize = 20.sp, fontWeight = FontWeight.Bold); Text("${novel.volumes.size} 卷 · ${novel.chapters.size} 章") }; Button(onClick = onAddVolume) { Icon(Icons.Default.Add, null); Spacer(Modifier.width(4.dp)); Text("新建分卷") } } } }
+        item { Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)) { Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("章节目录", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onPrimaryContainer); Text("${novel.volumes.size} 卷 · ${novel.chapters.size} 章", color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f)) }; FilledTonalButton(onClick = onAddVolume) { Icon(Icons.Default.CreateNewFolder, null); Spacer(Modifier.width(4.dp)); Text("新建分卷") } } } }
         novel.volumes.forEach { volume ->
             item(key = "volume_${volume.id}") {
                 var expanded by remember(volume.id) { mutableStateOf(true) }
-                val chapters = filteredChapters.filter { it.volumeId == volume.id }
-                Card(Modifier.fillMaxWidth()) {
+                val chapters = chaptersByVolume[volume.id].orEmpty()
+                Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp)) {
                     Column {
-                        Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
                             IconButton(onClick = { expanded = !expanded }) { Icon(if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore, null) }
                             Column(Modifier.weight(1f)) { Text(volume.title, fontSize = 18.sp, fontWeight = FontWeight.Bold); Text("${chapters.size} 章", fontSize = 12.sp) }
                             IconButton(onClick = { onRenameVolume(volume.id, volume.title) }) { Icon(Icons.Default.Edit, "重命名") }
@@ -1278,15 +1422,17 @@ private fun ChapterAndVolumeList(
                                         ReorderableItem {
                                             Card(
                                                 Modifier.fillMaxWidth()
-                                                    .graphicsLayer(alpha = if (isDragging) 0.7f else 1f)
-                                                    .clickable { onOpenChapter(c.id) }
+                                                    .graphicsLayer(alpha = if (isDragging) 0.72f else 1f)
+                                                    .clickable { onOpenChapter(c.id) },
+                                                shape = RoundedCornerShape(15.dp),
+                                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f))
                                             ) {
                                                 Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                                                     Icon(Icons.Default.DragHandle, null, modifier = Modifier.longPressDraggableHandle())
                                                     Spacer(Modifier.width(8.dp))
                                                     Column(Modifier.weight(1f)) {
                                                         Text(c.title, fontWeight = FontWeight.Bold)
-                                                        Text("${c.content.count { !it.isWhitespace() }} 字 · ${c.status}", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                                        Text("${c.wordCount()} 字 · ${c.status}", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                                     }
                                                     IconButton(onClick = { statusChapter = c }) { Icon(Icons.Default.Flag, "章节状态") }
                                                     IconButton(onClick = { menuChapter = c }) { Icon(Icons.Default.MoreVert, "章节操作") }
@@ -1303,7 +1449,7 @@ private fun ChapterAndVolumeList(
                                             Spacer(Modifier.width(8.dp))
                                             Column(Modifier.weight(1f)) {
                                                 Text(c.title, fontWeight = FontWeight.Bold)
-                                                Text("${c.content.count { !it.isWhitespace() }} 字 · ${c.status}", fontSize = 12.sp)
+                                                Text("${c.wordCount()} 字 · ${c.status}", fontSize = 12.sp)
                                             }
                                             IconButton(onClick = { statusChapter = c }) { Icon(Icons.Default.Flag, null) }
                                             IconButton(onClick = { menuChapter = c }) { Icon(Icons.Default.MoreVert, null) }
@@ -1329,25 +1475,54 @@ private fun DataList(
     onOpen: (Long) -> Unit,
     onDelete: (Long) -> Unit
 ) {
-    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        item { Button(onClick = onAdd, Modifier.fillMaxWidth()) { Icon(Icons.Default.Add, null); Spacer(Modifier.width(6.dp)); Text("新建") } }
-        items(items, key = { it.first }) { item ->
-            Card(
-                Modifier.fillMaxWidth().clickable { onOpen(item.first) }
-            ) {
-                Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+    LazyColumn(
+        Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 96.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        item(key = "data_list_header") {
+            Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(22.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)) {
+                Row(Modifier.fillMaxWidth().padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
-                        Text(item.second, fontWeight = FontWeight.Bold)
-                        Text("点击查看/编辑详情", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(if (items.isEmpty()) "从零开始构建" else "资料档案", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSecondaryContainer)
+                        Text("${items.size} 项资料 · 点击卡片查看详情", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.78f))
                     }
-                    IconButton(onClick = { onOpen(item.first) }) { Icon(Icons.Default.ChevronRight, "查看详情") }
-                    IconButton(onClick = { onDelete(item.first) }) { Icon(Icons.Default.Delete, "删除") }
+                    FilledTonalButton(onClick = onAdd) { Icon(Icons.Default.Add, null); Spacer(Modifier.width(4.dp)); Text("新建") }
+                }
+            }
+        }
+        if (items.isEmpty()) {
+            item(key = "empty_data") {
+                Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp)) {
+                    Column(Modifier.fillMaxWidth().padding(26.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                        Icon(Icons.Default.EditNote, null, modifier = Modifier.size(42.dp), tint = MaterialTheme.colorScheme.primary)
+                        Spacer(Modifier.height(8.dp))
+                        Text("还没有资料", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                        Text("新建一条资料，逐步完善你的设定。", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
+        } else items(items, key = { it.first }) { item ->
+            Card(
+                Modifier.fillMaxWidth().clickable { onOpen(item.first) },
+                shape = RoundedCornerShape(18.dp)
+            ) {
+                Row(Modifier.padding(horizontal = 14.dp, vertical = 13.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Surface(Modifier.size(44.dp), shape = RoundedCornerShape(14.dp), color = MaterialTheme.colorScheme.primaryContainer) {
+                        Box(contentAlignment = Alignment.Center) { Icon(Icons.Default.Article, null, tint = MaterialTheme.colorScheme.onPrimaryContainer) }
+                    }
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(item.second, fontWeight = FontWeight.Bold, fontSize = 16.sp, maxLines = 1)
+                        Text("设定资料 · 查看与编辑", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    IconButton(onClick = { onDelete(item.first) }) { Icon(Icons.Default.DeleteOutline, "删除") }
+                    Icon(Icons.Default.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
         }
     }
 }
-
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -1377,14 +1552,20 @@ private fun CharacterEditor(c: CharacterProfile, onBack: () -> Unit) {
     }
 
     EditorScaffold("人物资料", onBack) {
-        FormField("姓名", name) { name = it }
-        FormField("身份", identity) { identity = it }
-        FormField("外貌", appearance) { appearance = it }
-        FormField("性格", personality) { personality = it }
-        FormField("背景", background) { background = it }
-        FormField("能力", abilities) { abilities = it }
-        FormField("人物关系", relationships) { relationships = it }
-        FormField("备注", notes) { notes = it }
+        FormSection("基础档案", Icons.Default.Badge, "先确定角色的身份与外在特征") {
+            FormField("姓名", name) { name = it }
+            FormField("身份 / 职业", identity) { identity = it }
+            FormField("外貌特征", appearance) { appearance = it }
+        }
+        FormSection("性格与经历", Icons.Default.Psychology, "让人物拥有自己的动机与背景") {
+            FormField("性格", personality) { personality = it }
+            FormField("背景故事", background) { background = it }
+        }
+        FormSection("能力与关系", Icons.Default.Groups, "记录角色在故事中的作用") {
+            FormField("能力", abilities) { abilities = it }
+            FormField("人物关系", relationships) { relationships = it }
+            FormField("备注", notes) { notes = it }
+        }
     }
 }
 
@@ -1413,14 +1594,48 @@ private fun WorldEditor(w: WorldEntry, onBack: () -> Unit) {
         }
     }
 
-    EditorScaffold("世界资料", onBack) {
-        FormField("世界名称", name) { name = it }
-        FormField("地理环境", geography) { geography = it }
-        FormField("种族/居民", races) { races = it }
-        FormField("历史背景", history) { history = it }
-        FormField("国家/势力", factions) { factions = it }
-        FormField("规则/力量体系", rules) { rules = it }
-        FormField("备注", notes) { notes = it }
+    EditorScaffold("世界观设定", onBack) {
+        FormSection("世界概览", Icons.Default.Public, "定义这个世界的基本面貌") {
+            FormField("世界名称", name) { name = it }
+            FormField("地理环境", geography) { geography = it }
+            FormField("种族 / 居民", races) { races = it }
+        }
+        FormSection("历史与势力", Icons.Default.AccountTree, "整理世界如何发展、由谁影响") {
+            FormField("历史背景", history) { history = it }
+            FormField("国家 / 势力", factions) { factions = it }
+        }
+        FormSection("运行规则", Icons.Default.AutoAwesome, "记录魔法、科技或力量体系") {
+            FormField("规则 / 力量体系", rules) { rules = it }
+            FormField("备注", notes) { notes = it }
+        }
+    }
+}
+
+@Composable
+private fun FormSection(
+    title: String,
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    subtitle: String,
+    content: @Composable ColumnScope.() -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
+        Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Surface(shape = RoundedCornerShape(12.dp), color = MaterialTheme.colorScheme.secondaryContainer, modifier = Modifier.size(40.dp)) {
+                    Box(contentAlignment = Alignment.Center) { Icon(icon, null, tint = MaterialTheme.colorScheme.onSecondaryContainer) }
+                }
+                Spacer(Modifier.width(10.dp))
+                Column {
+                    Text(title, fontWeight = FontWeight.Bold, fontSize = 17.sp)
+                    Text(subtitle, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+            content()
+        }
     }
 }
 
@@ -1446,11 +1661,25 @@ private fun EditorScaffold(
         Column(
             Modifier.fillMaxSize()
                 .padding(padding)
-                .padding(16.dp)
+                .padding(horizontal = 16.dp, vertical = 12.dp)
                 .verticalScroll(rememberScrollState()),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-            content = content
-        )
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(20.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
+            ) {
+                Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text(title, fontSize = 20.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onPrimaryContainer)
+                        Text("资料会保存在当前小说中", fontSize = 13.sp, color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.78f))
+                    }
+                    Icon(Icons.Default.EditNote, null, tint = MaterialTheme.colorScheme.onPrimaryContainer, modifier = Modifier.size(28.dp))
+                }
+            }
+            content()
+        }
     }
 }
 
@@ -1461,7 +1690,8 @@ private fun FormField(label: String, value: String, onValue: (String) -> Unit) {
         onValueChange = onValue,
         modifier = Modifier.fillMaxWidth(),
         label = { Text(label) },
-        minLines = 2
+        minLines = 2,
+        shape = RoundedCornerShape(16.dp)
     )
 }
 
@@ -1473,26 +1703,69 @@ private fun EditorScreen(chapter: Chapter, novelTitle: String, onBack: () -> Uni
     var readingMode by remember(chapter.id) { mutableStateOf(false) }
     // Debounce autosave to reduce JSON serialization and disk writes while typing.
     LaunchedEffect(title, content) { delay(1000); onSave(title, content) }
-    Scaffold(topBar = {
-        TopAppBar(
-            title = { Column { Text(novelTitle); if (readingMode) Text("阅读模式", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary) } },
-            navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, null) } },
-            actions = {
-                Text("${content.count { !it.isWhitespace() }} 字", Modifier.padding(end = 8.dp))
-                IconButton(onClick = { readingMode = !readingMode }) { Icon(if (readingMode) Icons.Default.Edit else Icons.Default.MenuBook, if (readingMode) "退出阅读模式" else "阅读模式") }
-            }
-        )
-    }) { padding ->
+    var wordCount by remember(chapter.id) { mutableIntStateOf(content.count { !it.isWhitespace() }) }
+    LaunchedEffect(content) {
+        val snapshot = content
+        delay(250)
+        wordCount = withContext(Dispatchers.Default) { snapshot.count { !it.isWhitespace() } }
+    }
+    Scaffold(
+        containerColor = MaterialTheme.colorScheme.background,
+        topBar = {
+            TopAppBar(
+                title = {
+                    Column {
+                        Text(novelTitle, maxLines = 1)
+                        Text(if (readingMode) "沉浸阅读" else "正在写作 · 自动保存", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                },
+                navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, null) } },
+                actions = {
+                    Surface(shape = RoundedCornerShape(12.dp), color = MaterialTheme.colorScheme.secondaryContainer, modifier = Modifier.padding(end = 4.dp)) {
+                        Text("$wordCount 字", Modifier.padding(horizontal = 10.dp, vertical = 7.dp), fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSecondaryContainer)
+                    }
+                    IconButton(onClick = { readingMode = !readingMode }) { Icon(if (readingMode) Icons.Default.Edit else Icons.Default.MenuBook, if (readingMode) "退出阅读模式" else "阅读模式") }
+                }
+            )
+        }
+    ) { padding ->
         if (readingMode) {
-            Column(Modifier.fillMaxSize().padding(padding).verticalScroll(rememberScrollState()).padding(horizontal = 22.dp, vertical = 18.dp)) {
-                Text(title, fontSize = 28.sp, fontWeight = FontWeight.Bold)
-                Spacer(Modifier.height(22.dp)); Text(content.ifBlank { "（本章暂无正文）" }, fontSize = 19.sp, lineHeight = 34.sp)
+            Column(Modifier.fillMaxSize().padding(padding).verticalScroll(rememberScrollState()).padding(horizontal = 22.dp, vertical = 22.dp)) {
+                Text(title, fontSize = 30.sp, lineHeight = 38.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(18.dp))
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                Spacer(Modifier.height(20.dp))
+                Text(content.ifBlank { "（本章暂无正文）" }, fontSize = 19.sp, lineHeight = 34.sp)
             }
         } else {
-            Column(Modifier.fillMaxSize().padding(padding).padding(horizontal = 18.dp)) {
-                BasicTextField(value = title, onValueChange = { title = it }, textStyle = TextStyle(fontSize = 24.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onBackground), singleLine = true, modifier = Modifier.fillMaxWidth().padding(vertical = 16.dp))
-                HorizontalDivider()
-                BasicTextField(value = content, onValueChange = { content = it }, textStyle = TextStyle(fontSize = 18.sp, lineHeight = 30.sp, color = MaterialTheme.colorScheme.onBackground), modifier = Modifier.fillMaxWidth().weight(1f).padding(top = 16.dp), decorationBox = { inner -> if (content.isEmpty()) Text("在这里开始写正文……\n\n内容会自动保存在手机本地。", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 18.sp); inner() })
+            Column(Modifier.fillMaxSize().padding(padding).padding(horizontal = 12.dp, vertical = 10.dp)) {
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    shape = RoundedCornerShape(22.dp),
+                    color = MaterialTheme.colorScheme.surface
+                ) {
+                    Column(Modifier.fillMaxSize().padding(horizontal = 18.dp, vertical = 10.dp)) {
+                        BasicTextField(
+                            value = title,
+                            onValueChange = { title = it },
+                            textStyle = TextStyle(fontSize = 25.sp, lineHeight = 32.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface),
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 14.dp),
+                            decorationBox = { inner -> if (title.isEmpty()) Text("章节标题", fontSize = 25.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurfaceVariant); inner() }
+                        )
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                        BasicTextField(
+                            value = content,
+                            onValueChange = { content = it },
+                            textStyle = TextStyle(fontSize = 18.sp, lineHeight = 31.sp, color = MaterialTheme.colorScheme.onSurface),
+                            modifier = Modifier.fillMaxWidth().weight(1f).padding(top = 16.dp),
+                            decorationBox = { inner ->
+                                if (content.isEmpty()) Text("在这里开始写正文……\n\n你的灵感会自动保存在手机本地。", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 18.sp, lineHeight = 30.sp)
+                                inner()
+                            }
+                        )
+                    }
+                }
             }
         }
     }
